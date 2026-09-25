@@ -679,5 +679,10 @@ def tio_info() -> str:
     return state.tio_info()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the serial-mcp console script (uvx/pip installs)."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
