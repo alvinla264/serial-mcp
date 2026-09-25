@@ -239,7 +239,10 @@ def test_no_direct_attach_tools_exposed():
         "tio_info",
     }
     forbidden = {"connect_via_tio", "login", "logout", "enter_cli_mode", "check_mode"}
-    actual = set(asyncio.run(server.mcp.get_tools()).keys())
+    if hasattr(server.mcp, "get_tools"):
+        actual = set(asyncio.run(server.mcp.get_tools()).keys())  # fastmcp 2.x
+    else:
+        actual = {t.name for t in asyncio.run(server.mcp.list_tools())}  # fastmcp 3.x+
 
     assert actual == expected
     assert forbidden.isdisjoint(actual)

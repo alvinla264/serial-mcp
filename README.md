@@ -12,23 +12,31 @@ to watch or type — with any tty tool (tio, screen, minicom), or plain netcat.
 
 ### 1. Run the server
 
-Via nix (recommended, from this repo):
+**Without nix** — any Python 3.10+ with two pip packages:
 
-    nix build .            # optional; `nix run .` builds on demand
+    pip install fastmcp pyserial
+    python3 /path/to/serial-mcp/server.py
+
+Or with [uv](https://docs.astral.sh/uv/) (no venv juggling):
+
+    uv run --with fastmcp,pyserial /path/to/serial-mcp/server.py
+
+**With nix** (reproducible, pinned deps):
+
     nix run /path/to/serial-mcp
 
-Or plain python (fastmcp + pyserial in your environment):
-
-    python3 server.py
-
-Tests: `nix develop -c python -m pytest test_server.py` (or with pytest in any env).
+Tests: `nix develop -c python -m pytest test_server.py`, or
+`python3 -m pytest test_server.py` with fastmcp/pyserial/pytest installed.
 
 ### 2. Register with your AI agent
 
 Add the server to your agent's MCP config. Replace `/path/to/serial-mcp` with
 this repo's checkout path.
 
-**pi** (`~/.pi/agent/mcp.json`):
+All agents take a command + args; swap in whichever launcher you have.
+`/path/to/serial-mcp` below is this repo's checkout.
+
+**pi** (`~/.pi/agent/mcp.json`) — nix:
 
 ```json
 {
@@ -43,18 +51,35 @@ this repo's checkout path.
 }
 ```
 
+pi — no nix (uv or system python):
+
+```json
+{
+  "mcpServers": {
+    "serial-mcp": {
+      "transport": "stdio",
+      "command": "uv",
+      "args": ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"],
+      "lifecycle": "eager"
+    }
+  }
+}
+```
+
 **Claude Code** (`~/.claude.json` or project `.mcp.json`):
 
 ```bash
 claude mcp add serial-mcp -- nix run /path/to/serial-mcp
+# or without nix:
+claude mcp add serial-mcp -- uv run --with fastmcp,pyserial /path/to/serial-mcp/server.py
 ```
 
 **Codex CLI** (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.serial-mcp]
-command = "nix"
-args = ["run", "/path/to/serial-mcp"]
+command = "uv"
+args = ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
 ```
 
 **OpenCode** (`~/.config/opencode/opencode.json`):
@@ -64,7 +89,7 @@ args = ["run", "/path/to/serial-mcp"]
   "mcp": {
     "serial-mcp": {
       "type": "local",
-      "command": ["nix", "run", "/path/to/serial-mcp"]
+      "command": ["uv", "run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
     }
   }
 }
@@ -76,15 +101,16 @@ args = ["run", "/path/to/serial-mcp"]
 {
   "mcpServers": {
     "serial-mcp": {
-      "command": "nix",
-      "args": ["run", "/path/to/serial-mcp"]
+      "command": "uv",
+      "args": ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
     }
   }
 }
 ```
 
-**Cursor** (`~/.cursor/mcp.json`) — same JSON shape as pi's, with `"command":
-"nix"`, `"args": ["run", "/path/to/serial-mcp"]`.
+**Cursor** (`~/.cursor/mcp.json`) — same JSON shape as pi's no-nix variant:
+`"command": "uv"`, `"args": ["run", "--with", "fastmcp,pyserial",
+"/path/to/serial-mcp/server.py"]`.
 
 Then reload/restart the agent so it picks up the server, and just say
 "connect to the serial device".
