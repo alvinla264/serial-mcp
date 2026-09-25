@@ -8,78 +8,74 @@ reading, and serves a session socket that speaks tio's raw-byte `--socket`
 protocol. You attach to that session from your own terminal whenever you want
 to watch or type — with any tty tool (tio, screen, minicom), or plain netcat.
 
+Repo: https://github.com/alvinla264/serial-mcp
+
 ## Quick start
 
-### 1. Run the server
+There are three ways to run it, no local checkout required for any of them:
 
-**Without nix** — any Python 3.10+ with two pip packages:
+| Source | Command |
+|---|---|
+| **GitHub (recommended)** | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
+| **Local checkout + uv** | `uv run --with fastmcp,pyserial /path/to/serial-mcp/server.py` |
+| **Local checkout + nix** | `nix run github:alvinla264/serial-mcp` — or `nix run /path/to/serial-mcp` |
 
-    pip install fastmcp pyserial
-    python3 /path/to/serial-mcp/server.py
+Notes:
 
-Or with [uv](https://docs.astral.sh/uv/) (no venv juggling):
+- The GitHub/uvx and nix forms fetch, build, and run straight from the repo —
+  nothing to clone or install first.
+- Plain pip works too: `pip install fastmcp pyserial`, then
+  `python3 server.py` from a checkout.
+- Tests: `nix develop -c python -m pytest test_server.py`, or
+  `uv run --with fastmcp,pyserial,pytest python -m pytest test_server.py`.
+- Serial permissions still apply outside nix: your user needs `dialout` group
+  membership (or udev rules) to open `/dev/ttyUSB0`.
 
-    uv run --with fastmcp,pyserial /path/to/serial-mcp/server.py
+### Register with your AI agent
 
-**With nix** (reproducible, pinned deps):
+All agents take a command + args; pick the launcher form from the table above.
+The examples below use the GitHub source so there's no local path dependency —
+swap in a local-path form if you prefer a checkout. `alvinla264/serial-mcp`
+can be forked/replaced with your own.
 
-    nix run /path/to/serial-mcp
+Pin a specific version by appending `@<tag-or-commit>` to the git URL, e.g.
+`git+https://github.com/alvinla264/serial-mcp@v0.2.0`, otherwise the branch
+tip is re-resolved on each start.
 
-Tests: `nix develop -c python -m pytest test_server.py`, or
-`python3 -m pytest test_server.py` with fastmcp/pyserial/pytest installed.
-
-### 2. Register with your AI agent
-
-Add the server to your agent's MCP config. Replace `/path/to/serial-mcp` with
-this repo's checkout path.
-
-All agents take a command + args; swap in whichever launcher you have.
-`/path/to/serial-mcp` below is this repo's checkout.
-
-**pi** (`~/.pi/agent/mcp.json`) — nix:
-
-```json
-{
-  "mcpServers": {
-    "serial-mcp": {
-      "transport": "stdio",
-      "command": "nix",
-      "args": ["run", "/path/to/serial-mcp"],
-      "lifecycle": "eager"
-    }
-  }
-}
-```
-
-pi — no nix (uv or system python):
+**pi** (`~/.pi/agent/mcp.json`) — GitHub via uvx:
 
 ```json
 {
   "mcpServers": {
     "serial-mcp": {
       "transport": "stdio",
-      "command": "uv",
-      "args": ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"],
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/alvinla264/serial-mcp",
+        "serial-mcp"
+      ],
       "lifecycle": "eager"
     }
   }
 }
 ```
+
+pi — local checkout via nix: `"command": "nix"`,
+`"args": ["run", "/path/to/serial-mcp"]`.
 
 **Claude Code** (`~/.claude.json` or project `.mcp.json`):
 
 ```bash
-claude mcp add serial-mcp -- nix run /path/to/serial-mcp
-# or without nix:
-claude mcp add serial-mcp -- uv run --with fastmcp,pyserial /path/to/serial-mcp/server.py
+claude mcp add serial-mcp -- uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp
 ```
 
 **Codex CLI** (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.serial-mcp]
-command = "uv"
-args = ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
+command = "uvx"
+args = ["--from", "git+https://github.com/alvinla264/serial-mcp", "serial-mcp"]
 ```
 
 **OpenCode** (`~/.config/opencode/opencode.json`):
@@ -89,7 +85,12 @@ args = ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
   "mcp": {
     "serial-mcp": {
       "type": "local",
-      "command": ["uv", "run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
+      "command": [
+        "uvx",
+        "--from",
+        "git+https://github.com/alvinla264/serial-mcp",
+        "serial-mcp"
+      ]
     }
   }
 }
@@ -101,19 +102,24 @@ args = ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
 {
   "mcpServers": {
     "serial-mcp": {
-      "command": "uv",
-      "args": ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/alvinla264/serial-mcp",
+        "serial-mcp"
+      ]
     }
   }
 }
 ```
 
-**Cursor** (`~/.cursor/mcp.json`) — same JSON shape as pi's no-nix variant:
-`"command": "uv"`, `"args": ["run", "--with", "fastmcp,pyserial",
-"/path/to/serial-mcp/server.py"]`.
+**Cursor** (`~/.cursor/mcp.json`) — same JSON shape as Gemini's: `"command":
+"uvx"`, `"args": ["--from", "git+https://github.com/alvinla264/serial-mcp",
+"serial-mcp"]`.
 
 **VS Code** (Copilot Chat MCP support, `.vscode/mcp.json` in the workspace or
-`~/.vscode/mcp.json` for all projects):
+`~/.vscode/mcp.json` for all projects) — note the `"servers"` wrapper and
+`"type": "stdio"`:
 
 ```json
 {
@@ -137,7 +143,7 @@ Copilot Chat in agent mode and ask it to connect to the serial device.
 Then reload/restart the agent so it picks up the server, and just say
 "connect to the serial device".
 
-### 3. Share the session from your terminal
+### Share the session from your terminal
 
 1. Tell the AI to connect: it calls `connect(port="/dev/ttyUSB0")` and reports
    the session socket, e.g. `/tmp/serial-mcp-ttyUSB0.sock` (derived from the
@@ -198,7 +204,7 @@ Then reload/restart the agent so it picks up the server, and just say
 Two attach surfaces share one broadcast path:
 
 - **Companion pty** (`/tmp/serial-mcp-<dev>`, a symlink to a virtual tty):
-  what real tio attaches to — it just sees a normal serial device.
+  what terminal tools attach to — it just looks like a normal serial device.
 - **UNIX socket** (`/tmp/serial-mcp-<dev>.sock`): speaks tio's `--socket`
   protocol (see tio `src/socket.c`), which is raw bytes: all device output is
   broadcast to every attached client, and every client's bytes are forwarded
