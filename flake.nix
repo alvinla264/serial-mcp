@@ -1,5 +1,5 @@
 {
-  description = "Serial MCP Server for Embedded Linux Testing";
+  description = "Generic Serial Transport MCP Server";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -15,6 +15,7 @@
         pythonPackages = ps: with ps; [
           fastmcp
           pyserial
+          pytest
         ];
         
         pythonEnv = pkgs.python3.withPackages pythonPackages;
@@ -32,7 +33,7 @@
             mkdir -p $out/bin
             cp server.py $out/bin/serial-mcp
             chmod +x $out/bin/serial-mcp
-            
+
             # Wrap the script to use the correct python environment
             wrapProgram $out/bin/serial-mcp \
               --prefix PATH : ${pythonEnv}/bin
