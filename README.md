@@ -112,6 +112,28 @@ args = ["run", "--with", "fastmcp,pyserial", "/path/to/serial-mcp/server.py"]
 `"command": "uv"`, `"args": ["run", "--with", "fastmcp,pyserial",
 "/path/to/serial-mcp/server.py"]`.
 
+**VS Code** (Copilot Chat MCP support, `.vscode/mcp.json` in the workspace or
+`~/.vscode/mcp.json` for all projects):
+
+```json
+{
+  "servers": {
+    "serial-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/alvinla264/serial-mcp",
+        "serial-mcp"
+      ]
+    }
+  }
+}
+```
+
+Reload with the `MCP: List Servers` command (or restart VS Code), then start
+Copilot Chat in agent mode and ask it to connect to the serial device.
+
 Then reload/restart the agent so it picks up the server, and just say
 "connect to the serial device".
 
