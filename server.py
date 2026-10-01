@@ -889,12 +889,8 @@ class SerialState:
             )
         with self.session_lock:
             count = len(self.session_clients)
-        tty_path = self.session_pty_link
-        attach = f"Attach with any tty tool, e.g.:  tio {tty_path}\n" if tty_path else ""
         return (
-            f"AI holds the device ({self.ser.port}); session socket: {self.session_path} "
-            f"({count} client(s) attached, tio raw-byte protocol).\n"
-            + attach
+            f"AI holds the device ({self.ser.port}); {count} client(s) attached.\n"
             + _attach_hint(self.session_path)
         )
 
