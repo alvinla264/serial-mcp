@@ -9,12 +9,14 @@ their own terminal (real tio via a socat pty bridge, or nc -UN).
 from __future__ import annotations
 
 import re
+import json
 import socket
 import threading
 import time
 import errno
 import os
 from collections import deque
+from pathlib import Path
 
 import serial
 import serial.tools.list_ports
@@ -48,6 +50,40 @@ def _attach_hint(path: str) -> str:
         f"e.g.:  tio {tty_path}\n"
         f"or poke it directly:  echo cmd | nc -UN {path}\n"
     )
+
+
+# Built-in bootloader profiles: the shareable "recipe" for entering U-Boot on a
+# device family. Credentials are NEVER stored here — profiles reference a
+# credential key resolved from the local, gitignored credentials file.
+BUILTIN_BOOT_PROFILES = {
+    "generic": {
+        "description": "Generic U-Boot: tap Space during the autoboot window.",
+        "bootloader_prompt_regex": r"(U-Boot|uboot)[^\n]*[>#]\s|^\s*=>\s",
+        "abort_regex": r"(login:|Login:)",
+        "interrupt": {"keys": [" "], "delay": 0.2, "interval": 0.05, "max_attempts": 40},
+        "reboot": {"command": "reboot", "cycles": 3},
+    },
+    "u-boot-any-key": {
+        "description": "U-Boot variants that accept any character to abort autoboot.",
+        "bootloader_prompt_regex": r"(U-Boot|uboot)[^\n]*[>#]\s|^\s*=>\s",
+        "abort_regex": r"(login:|Login:)",
+        "interrupt": {"keys": ["\r", " ", "x"], "delay": 0.2, "interval": 0.05, "max_attempts": 40},
+        "reboot": {"command": "reboot", "cycles": 3},
+    },
+}
+
+CONFIG_DIR = Path(os.environ.get("SERIAL_MCP_CONFIG", "~/.config/serial-mcp")).expanduser()
+USER_PROFILES_PATH = CONFIG_DIR / "profiles.json"
+CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
+
+
+def _load_json_file(path: Path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 class SerialState:
@@ -247,6 +283,13 @@ class SerialState:
         if not pattern:
             return None
         return re.compile(pattern.encode("utf-8"))
+
+    def _raw_logged_write(self, data: bytes) -> None:
+        with self.write_lock:
+            self._log("TX", data)
+            self._record_io("TX", "ai", data)
+            self.ser.write(data)
+            self.ser.flush()
 
     def _snapshot_len(self) -> int:
         with self.buffer_lock:
@@ -520,6 +563,183 @@ class SerialState:
         except OSError:
             pass
 
+    # ---- bootloader entry -----------------------------------------------
+
+    def _merged_boot_profiles(self) -> dict:
+        profiles = {k: dict(v) for k, v in BUILTIN_BOOT_PROFILES.items()}
+        for key, prof in _load_json_file(USER_PROFILES_PATH).items():
+            base = dict(profiles.get(key, {}))
+            base.update(prof if isinstance(prof, dict) else {})
+            profiles[key] = base
+        return profiles
+
+    def _redacted_write(self, data: bytes) -> None:
+        """Write to the port but keep secrets out of the log and transcript."""
+        with self.write_lock:
+            self._log("TX", "[redacted]")
+            self._record_io("TX", "ai", b"[redacted]")
+            self.ser.write(data)
+            self.ser.flush()
+
+    def _try_login(self, username: str, password: str, seen: str, encoding: str) -> bool:
+        """Complete a login if a login prompt is visible. Returns True when a
+        shell-ish state is (probably) reached or a login attempt was made."""
+        if not re.search(r"login:", seen, re.IGNORECASE):
+            return False
+        self._raw_logged_write((username + "\n").encode(encoding))
+        out = self._wait_for_output(self._snapshot_len(), timeout=5.0, idle_timeout=0.5, terminator=None)
+        seen += out.decode(encoding, errors="replace")
+        if re.search(r"password", seen, re.IGNORECASE):
+            self._redacted_write((password + "\n").encode(encoding))
+            out = self._wait_for_output(self._snapshot_len(), timeout=8.0, idle_timeout=0.8, terminator=None)
+            seen += out.decode(encoding, errors="replace")
+        return True
+
+    def enter_bootloader(
+        self,
+        profile: str | None = None,
+        interrupt_keys: list[str] | None = None,
+        success_regex: str | None = None,
+        abort_regex: str | None = None,
+        reboot: bool = True,
+        reboot_command: str | None = None,
+        delay: float | None = None,
+        interval: float | None = None,
+        max_attempts: int | None = None,
+        login_username: str | None = None,
+        login_password: str | None = None,
+        overall_timeout: float = 120.0,
+        encoding: str = "utf-8",
+    ) -> str:
+        """Automated U-Boot entry: login (if needed) -> reboot -> paced interrupt
+        tapping -> success detection. All parameters fall back to the profile,
+        then to generic defaults."""
+        prof = self._merged_boot_profiles().get(profile or "", {})
+        if profile and not prof:
+            return (
+                f"Error: unknown boot profile '{profile}'. See list_boot_profiles; "
+                f"user profiles live in {USER_PROFILES_PATH}."
+            )
+        if not self.ser or not self.ser.is_open:
+            return "Error: Not connected to a serial port."
+
+        iprof = prof.get("interrupt", {})
+        rprof = prof.get("reboot", {})
+        keys = interrupt_keys or iprof.get("keys", [" "])
+        delay = float(delay if delay is not None else iprof.get("delay", 0.2))
+        interval = float(interval if interval is not None else iprof.get("interval", 0.05))
+        max_attempts = int(max_attempts if max_attempts is not None else iprof.get("max_attempts", 40))
+        success_src = success_regex or prof.get("bootloader_prompt_regex", r"(U-Boot|uboot)[^\n]*[>#]\s|^\s*=>\s")
+        success_re = re.compile(success_src)
+        abort_src = abort_regex or prof.get("abort_regex")
+        abort_re = re.compile(abort_src) if abort_src else None
+        reboot_command = reboot_command or rprof.get("command", "reboot")
+        max_cycles = int(rprof.get("cycles", 3)) if reboot else 1
+
+        # Credentials: explicit args win; else resolve profile login section.
+        username, password = login_username, login_password
+        login_cfg = prof.get("login") or {}
+        cred_key = login_cfg.get("password_ref") or profile
+        creds = _load_json_file(CREDENTIALS_PATH).get(cred_key, {})
+        username = username or login_cfg.get("username") or creds.get("username")
+        password = password or creds.get("password")
+
+        deadline = time.monotonic() + overall_timeout
+        seen = ""
+        logged_in = False
+        start = self._snapshot_len()
+
+        # Maybe already sitting in U-Boot.
+        buffered = self._wait_for_output(start, timeout=0.2, idle_timeout=0.05, terminator=None)
+        seen += buffered.decode(encoding, errors="replace")
+        if success_re.search(seen):
+            return f"Already in bootloader.\n\nMatched: {seen[-300:]}"
+
+        for cycle in range(1, max_cycles + 1):
+            if time.monotonic() > deadline:
+                break
+
+            # Reboot (with login first if the device is sitting at a login prompt).
+            if reboot or cycle > 1:
+                if abort_re and abort_re.search(seen) and username and password and not logged_in:
+                    self._try_login(username, password, seen, encoding)
+                    logged_in = True
+                self._raw_logged_write((reboot_command + "\n").encode(encoding))
+                # Wait for the reboot banner / autoboot window to open.
+                banner = self._wait_for_output(
+                    self._snapshot_len(), timeout=15.0, idle_timeout=0.8, terminator=None
+                )
+                seen += banner.decode(encoding, errors="replace")
+                if success_re.search(seen):
+                    return self._bootloader_success(seen)
+                # Device booted back to a login prompt instead of into autoboot:
+                # log in now so the next reboot works.
+                if (
+                    abort_re
+                    and abort_re.search(banner.decode(encoding, errors="replace"))
+                    and username
+                    and password
+                    and not logged_in
+                ):
+                    self._try_login(username, password, seen, encoding)
+                    logged_in = True
+                    continue  # next cycle reboots from the shell
+                time.sleep(max(delay, 0.0))
+
+            # Paced interrupt tapping.
+            for key in keys * 1:
+                for _ in range(max_attempts):
+                    if time.monotonic() > deadline:
+                        return self._bootloader_failure(seen, deadline_hit=True)
+                    self._raw_logged_write(key.encode(encoding))
+                    out = self._wait_for_output(
+                        self._snapshot_len(), timeout=interval + 0.05, idle_timeout=0.02, terminator=None
+                    )
+                    seen += out.decode(encoding, errors="replace")
+                    if success_re.search(seen):
+                        return self._bootloader_success(seen)
+                if abort_re and abort_re.search(seen):
+                    break  # device booted to Linux; next cycle reboots
+
+        return self._bootloader_failure(seen, deadline_hit=time.monotonic() > deadline)
+
+    def _bootloader_success(self, seen: str) -> str:
+        return "Entered bootloader.\n\nTail of output:\n" + seen[-400:]
+
+    def _bootloader_failure(self, seen: str, deadline_hit: bool = False) -> str:
+        why = "overall timeout reached" if deadline_hit else "interrupt keys exhausted without matching the success pattern"
+        return (
+            f"Failed to enter bootloader ({why}).\n\n"
+            "Check: correct interrupt key? autoboot window longer than tap window? "
+            "device actually rebooting? Tail of output:\n" + seen[-500:]
+        )
+
+    def list_boot_profiles(self) -> str:
+        profiles = self._merged_boot_profiles()
+        lines = []
+        for name, prof in sorted(profiles.items()):
+            desc = prof.get("description", "")
+            keys = prof.get("interrupt", {}).get("keys", [" "])
+            login = "login: yes" if prof.get("login") or name in _load_json_file(CREDENTIALS_PATH) else "login: not configured"
+            source = "builtin" if name in BUILTIN_BOOT_PROFILES else "user"
+            lines.append(f"{name} [{source}]  interrupt={keys}  {login}\n  {desc}")
+        return "\n".join(lines) if lines else "No profiles."
+
+    def set_boot_credentials(self, profile_key: str, username: str, password: str) -> str:
+        """Store login credentials locally (gitignored, mode 0600). Never logged."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            creds = _load_json_file(CREDENTIALS_PATH)
+            creds[profile_key] = {"username": username, "password": password}
+            fd = os.open(CREDENTIALS_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(creds, f, indent=2)
+            os.chmod(CREDENTIALS_PATH, 0o600)
+            self._log("SYS", f"Stored credentials for profile '{profile_key}' (redacted)")
+            return f"Credentials stored locally for '{profile_key}' at {CREDENTIALS_PATH} (mode 0600, gitignored location)."
+        except Exception as e:
+            return f"Error storing credentials: {e}"
+
     # ---- inspection tools ----------------------------------------------
 
     def view_io(self, lines: int = 50, direction: str = "all", hex_mode: bool = False, encoding: str = "utf-8") -> str:
@@ -648,6 +868,84 @@ def clear_output() -> str:
 def set_prompt_pattern(regex_pattern: str | None = None) -> str:
     """Set or clear the default regex terminator used by send_command."""
     return state.set_prompt_pattern(regex_pattern)
+
+
+@mcp.tool()
+def list_boot_profiles() -> str:
+    """List known bootloader-entry profiles (builtin + user-defined).
+
+    User profiles live in ~/.config/serial-mcp/profiles.json; credentials are
+    stored separately in ~/.config/serial-mcp/credentials.json (mode 0600) and
+    are never displayed.
+    """
+    return state.list_boot_profiles()
+
+
+@mcp.tool()
+def set_boot_credentials(profile_key: str, username: str, password: str) -> str:
+    """Store device login credentials locally for use by enter_bootloader.
+
+    Credentials are written to ~/.config/serial-mcp/credentials.json with mode
+    0600 (outside any repo). They are redacted from logs and view_io transcripts.
+
+    Args:
+        profile_key: Key that profiles reference via login.password_ref (or the
+            profile name itself).
+        username: Login username.
+        password: Login password (stored locally only; redacted in logs).
+    """
+    return state.set_boot_credentials(profile_key, username, password)
+
+
+@mcp.tool()
+def enter_bootloader(
+    profile: str | None = None,
+    interrupt_keys: list[str] | None = None,
+    success_regex: str | None = None,
+    abort_regex: str | None = None,
+    reboot: bool = True,
+    reboot_command: str | None = None,
+    delay: float | None = None,
+    interval: float | None = None,
+    max_attempts: int | None = None,
+    login_username: str | None = None,
+    login_password: str | None = None,
+    overall_timeout: float = 120.0,
+    encoding: str = "utf-8",
+) -> str:
+    """Enter the device's U-Boot bootloader automatically.
+
+    Flow: optionally log in (if the device sits at a login prompt), reboot,
+    wait for the autoboot window, then send interrupt keys at a paced interval
+    until the bootloader prompt appears. Never loops forever: attempts are
+    capped and the whole operation has a wall-clock timeout.
+
+    Args:
+        profile: Named boot profile (see list_boot_profiles). Provides defaults
+            for everything below.
+        interrupt_keys: Characters to tap during the autoboot window, e.g. [" "].
+            Sent repeatedly; each key is tried max_attempts times.
+        success_regex: Regex indicating the bootloader prompt was reached.
+        abort_regex: Regex indicating the device booted fully (e.g. "Login:") —
+            triggers another login+reboot cycle instead of endless tapping.
+        reboot: Whether to issue the reboot command first (False = device is
+            already cycling / power-cycled externally).
+        reboot_command: Shell command to reboot (default from profile or "reboot").
+        delay: Seconds to wait after reboot before tapping begins.
+        interval: Seconds between interrupt key taps (pacing protects the RX
+            buffer — flooding can cause dropped characters in U-Boot).
+        max_attempts: Hard cap on interrupt keys per pass.
+        login_username: Explicit username (overrides profile/credentials).
+        login_password: Explicit password (overrides profile/credentials;
+            prefer set_boot_credentials so secrets stay out of logs).
+        overall_timeout: Wall-clock cap in seconds for the entire operation.
+        encoding: Text encoding for the serial stream.
+    """
+    return state.enter_bootloader(
+        profile, interrupt_keys, success_regex, abort_regex, reboot,
+        reboot_command, delay, interval, max_attempts,
+        login_username, login_password, overall_timeout, encoding,
+    )
 
 
 @mcp.tool()

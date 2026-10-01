@@ -1,7 +1,10 @@
+import json
 import os
 import pty
 import select
 import socket
+
+import pytest
 import threading
 import time
 import asyncio
@@ -237,6 +240,9 @@ def test_no_direct_attach_tools_exposed():
         "view_io",
         "list_serial_ports",
         "tio_info",
+        "list_boot_profiles",
+        "set_boot_credentials",
+        "enter_bootloader",
     }
     forbidden = {"connect_via_tio", "login", "logout", "enter_cli_mode", "check_mode"}
     if hasattr(server.mcp, "get_tools"):
@@ -456,3 +462,133 @@ def test_rx_logging_flushes_newline_free_partial_once_on_idle_and_disconnect():
         assert sum("PROMPT> " in line for line in rx_lines) == 1
     finally:
         _cleanup(master, slave, stop, thread)
+
+
+# ---- bootloader entry -------------------------------------------------------
+
+import server as _server_mod
+
+
+@pytest.fixture()
+def boot_creds(monkeypatch, tmp_path):
+    """Point config dir at a temp location."""
+    monkeypatch.setattr(_server_mod, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(_server_mod, "USER_PROFILES_PATH", tmp_path / "profiles.json")
+    monkeypatch.setattr(_server_mod, "CREDENTIALS_PATH", tmp_path / "credentials.json")
+    return tmp_path
+
+
+def _uboot_device_handler(state_box):
+    """Fake device: autoboot window responds to Space; else boots to Login.
+
+    Full flow: login root/sekrit -> reboot -> autoboot -> Space -> U-Boot#.
+    """
+    def handler(master, stop):
+        buf = b""
+        stage = "running"
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                data = os.read(master, 1024)
+                buf += data
+                if stage == "running":
+                    if b"root" in buf:
+                        os.write(master, b"Password: ")
+                        stage = "password"
+                        buf = b""
+                elif stage == "password":
+                    if b"sekrit" in buf:
+                        os.write(master, b"root@dev:~# ")
+                        stage = "shell"
+                        buf = b""
+                elif stage == "shell":
+                    if b"reboot" in buf:
+                        os.write(master, b"Hit any key to stop autoboot: 3 ")
+                        stage = "autoboot"
+                        buf = b""
+                elif stage == "autoboot":
+                    if b" " in buf:
+                        os.write(master, b"\r\nU-Boot> ")
+                        stage = "uboot"
+                        buf = b""
+                    elif b"\n" in buf:  # newline = missed window
+                        os.write(master, b"test-device login: ")
+                        stage = "running"
+                        buf = b""
+            time.sleep(0.01)
+    return handler
+
+
+def test_list_boot_profiles_builtin_and_user_file(boot_creds):
+    text = state.list_boot_profiles()
+    assert "generic [builtin]" in text
+    assert "u-boot-any-key [builtin]" in text
+    # user profile merge
+    boot_creds.joinpath("profiles.json").write_text(json.dumps({
+        "mydevice": {"description": "custom", "interrupt": {"keys": ["1"]}}
+    }))
+    text = state.list_boot_profiles()
+    assert "mydevice [user]" in text and "custom" in text
+
+
+def test_set_boot_credentials_writes_0600_file(boot_creds):
+    result = state.set_boot_credentials("mydevice", "root", "sekrit")
+    assert "0600" in result
+    p = boot_creds / "credentials.json"
+    assert oct(p.stat().st_mode & 0o777) == "0o600"
+    data = json.loads(p.read_text())
+    assert data["mydevice"] == {"username": "root", "password": "sekrit"}
+
+
+def test_enter_bootloader_full_flow_login_reboot_interrupt(boot_creds):
+    state.set_boot_credentials("generic", "root", "sekrit")
+    # generic profile has no login section; creds keyed by profile name resolve.
+    state.enter_bootloader  # existence check
+
+    def handler(master, stop):
+        buf = b""
+        stage = "login"
+        last_prompt = 0.0
+        while not stop.is_set():
+            # Real consoles (getty) re-prompt continuously; also survives the
+            # pyserial open-time flush of pending input.
+            if stage == "login" and time.monotonic() - last_prompt > 0.3:
+                os.write(master, b"test-device login: ")
+                last_prompt = time.monotonic()
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                data = os.read(master, 1024)
+                buf += data
+                if stage == "login" and b"root" in buf:
+                    os.write(master, b"Password: ")
+                    stage, buf = "password", b""
+                elif stage == "password" and b"sekrit" in buf:
+                    os.write(master, b"root@dev:~# ")
+                    stage, buf = "shell", b""
+                elif stage == "shell" and b"reboot" in buf:
+                    os.write(master, b"Hit any key to stop autoboot: 3 ")
+                    stage, buf = "autoboot", b""
+                elif stage == "autoboot" and b" " in buf:
+                    os.write(master, b"\r\nU-Boot> ")
+                    stage, buf = "uboot", b""
+                elif stage == "uboot":
+                    pass
+            time.sleep(0.01)
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        result = state.enter_bootloader(profile="generic")
+        assert "Entered bootloader" in result, result
+        assert "U-Boot" in result
+        # password never appears in the I/O transcript
+        assert "sekrit" not in state.view_io(lines=100)
+        assert "[redacted]" in state.view_io(lines=100)
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_enter_bootloader_unknown_profile_and_not_connected():
+    assert state.enter_bootloader(profile="nope").startswith("Error: unknown boot profile")
+    state.disconnect()
+    assert state.enter_bootloader().startswith("Error: Not connected")

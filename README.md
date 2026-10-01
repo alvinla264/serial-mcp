@@ -199,6 +199,47 @@ Then reload/restart the agent so it picks up the server, and just say
 - `tio_info()`: connection status, the session socket path, attached client
   count, and attach instructions.
 
+### Bootloader entry (U-Boot)
+
+Automated login -> reboot -> autoboot-interrupt flow:
+
+- `enter_bootloader(...)`: logs in if the device sits at a login prompt,
+  reboots, then sends interrupt keys at a paced interval during the autoboot
+  window until the U-Boot prompt appears. Pacing (`interval`, default 50ms)
+  matters: flooding a U-Boot console can overflow the RX buffer and *drop*
+  interrupt characters. Hard caps everywhere: `max_attempts` per pass and
+  `overall_timeout` for the whole operation; if an `abort_regex` (e.g.
+  `Login:`) shows the device booted fully, it logs in and reboots again
+  instead of tapping into a dead console.
+- `list_boot_profiles()`: shows known device profiles (builtin: `generic`,
+  `u-boot-any-key`).
+- `set_boot_credentials(profile_key, username, password)`: stores login
+  credentials locally for a profile.
+
+**Profiles** (shareable) vs **credentials** (local-only): profiles describe the
+*recipe* — interrupt keys, pacing, reboot command, prompt regexes, and a
+`login: {username, password_ref}` reference. Secrets never live in profiles.
+Credentials are stored at `~/.config/serial-mcp/credentials.json` (mode 0600,
+outside any repo) and are redacted from logs and `view_io` transcripts.
+
+Custom profiles go in `~/.config/serial-mcp/profiles.json`:
+
+```json
+{
+  "mydevice": {
+    "description": "Vendor X board",
+    "bootloader_prompt_regex": "(U-Boot|uboot)[^\n]*[>#]\s|^\s*=>\s",
+    "abort_regex": "(login:|Login:)",
+    "interrupt": { "keys": [" "], "delay": 0.2, "interval": 0.05, "max_attempts": 40 },
+    "reboot": { "command": "reboot", "cycles": 3 },
+    "login": { "username": "root", "password_ref": "mydevice" }
+  }
+}
+```
+
+Then: `set_boot_credentials("mydevice", "root", "…")` once, and the AI can
+just call `enter_bootloader(profile="mydevice")`.
+
 ## Session protocol notes
 
 Two attach surfaces share one broadcast path:
