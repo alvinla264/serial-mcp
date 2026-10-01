@@ -58,14 +58,14 @@ def _attach_hint(path: str) -> str:
 BUILTIN_BOOT_PROFILES = {
     "generic": {
         "description": "Generic U-Boot: tap Space during the autoboot window.",
-        "bootloader_prompt_regex": r"(U-Boot|uboot)[^\n]*[>#]\s|^\s*=>\s",
+        "bootloader_prompt_regex": r"(U-Boot|uboot)[^\n]*[>#]\s|Enter magic string to stop autoboot|^\s*=>\s",
         "abort_regex": r"(login:|Login:)",
         "interrupt": {"keys": [" "], "delay": 0.2, "interval": 0.05, "max_attempts": 40},
         "reboot": {"command": "reboot", "cycles": 3},
     },
     "u-boot-any-key": {
         "description": "U-Boot variants that accept any character to abort autoboot.",
-        "bootloader_prompt_regex": r"(U-Boot|uboot)[^\n]*[>#]\s|^\s*=>\s",
+        "bootloader_prompt_regex": r"(U-Boot|uboot)[^\n]*[>#]\s|Enter magic string to stop autoboot|^\s*=>\s",
         "abort_regex": r"(login:|Login:)",
         "interrupt": {"keys": ["\r", " ", "x"], "delay": 0.2, "interval": 0.05, "max_attempts": 40},
         "reboot": {"command": "reboot", "cycles": 3},
@@ -581,18 +581,66 @@ class SerialState:
             self.ser.write(data)
             self.ser.flush()
 
+    def _blind_login(self, username: str, password: str, encoding: str, settle: float = 0.6) -> None:
+        """Log in without verifying prompts.
+
+        On consoles that are flooded with unsolicited logging (mesh daemons
+        retrying, kernel spew), prompt detection is unreliable: the login banner
+        scrolls past, timeouts reset the prompt, and output-based verification
+        reads noise. This does what a human does instead — wakes the console,
+        waits a beat, then sends username and password on a schedule and assumes
+        it worked. Any wrong-prompt misdelivery simply fails and is retried by
+        the caller's next cycle.
+        """
+        self._raw_logged_write(b"\r")
+        time.sleep(settle)
+        self._raw_logged_write((username + "\n").encode(encoding))
+        time.sleep(settle)
+        self._redacted_write((password + "\n").encode(encoding))
+        time.sleep(settle)
+
     def _try_login(self, username: str, password: str, seen: str, encoding: str) -> bool:
-        """Complete a login if a login prompt is visible. Returns True when a
-        shell-ish state is (probably) reached or a login attempt was made."""
+        """Complete a login if a login prompt is visible.
+
+        Polls for the "Password:" prompt (gives up if the device never asks),
+        then submits the password without logging it. Wakes the console with a
+        CR first because the prompt often only appears after a keypress.
+        """
+        self._raw_logged_write(b"\r")
+        out = self._wait_for_output(self._snapshot_len(), timeout=2.0, idle_timeout=0.5, terminator=None)
+        seen += out.decode(encoding, errors="replace")
         if not re.search(r"login:", seen, re.IGNORECASE):
             return False
+
         self._raw_logged_write((username + "\n").encode(encoding))
-        out = self._wait_for_output(self._snapshot_len(), timeout=5.0, idle_timeout=0.5, terminator=None)
-        seen += out.decode(encoding, errors="replace")
-        if re.search(r"password", seen, re.IGNORECASE):
-            self._redacted_write((password + "\n").encode(encoding))
-            out = self._wait_for_output(self._snapshot_len(), timeout=8.0, idle_timeout=0.8, terminator=None)
-            seen += out.decode(encoding, errors="replace")
+        got_password = False
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            out = self._wait_for_output(
+                self._snapshot_len(), timeout=1.0, idle_timeout=0.3, terminator=None
+            )
+            chunk = out.decode(encoding, errors="replace")
+            seen += chunk
+            if re.search(r"password", chunk, re.IGNORECASE):
+                got_password = True
+                break
+            if re.search(r"[#$]\s*$", chunk):
+                return True  # already at a shell, no password needed
+        if not got_password:
+            return False
+
+        self._redacted_write((password + "\n").encode(encoding))
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            out = self._wait_for_output(
+                self._snapshot_len(), timeout=1.0, idle_timeout=0.5, terminator=None
+            )
+            chunk = out.decode(encoding, errors="replace")
+            seen += chunk
+            if re.search(r"Login incorrect", chunk):
+                return False
+            if re.search(r"(root@|#\s*$|\$\s*$)", chunk):
+                return True
         return True
 
     def enter_bootloader(
@@ -608,6 +656,7 @@ class SerialState:
         max_attempts: int | None = None,
         login_username: str | None = None,
         login_password: str | None = None,
+        login_mode: str = "auto",
         overall_timeout: float = 120.0,
         encoding: str = "utf-8",
     ) -> str:
@@ -652,56 +701,112 @@ class SerialState:
         # Maybe already sitting in U-Boot.
         buffered = self._wait_for_output(start, timeout=0.2, idle_timeout=0.05, terminator=None)
         seen += buffered.decode(encoding, errors="replace")
-        if success_re.search(seen):
+        if self._is_bootloader_prompt(seen, success_re):
             return f"Already in bootloader.\n\nMatched: {seen[-300:]}"
 
         for cycle in range(1, max_cycles + 1):
             if time.monotonic() > deadline:
                 break
 
-            # Reboot (with login first if the device is sitting at a login prompt).
-            if reboot or cycle > 1:
-                if abort_re and abort_re.search(seen) and username and password and not logged_in:
-                    self._try_login(username, password, seen, encoding)
+            # Establish a shell first: probe the console, and if a login prompt
+            # is (or becomes) visible, complete the login before rebooting.
+            # Relying on previously-seen output is not enough — the prompt may
+            # appear only now, and typing reboot into a login prompt just
+            # produces "Login incorrect".
+            if not logged_in and username and password:
+                mode = login_mode
+                if mode == "auto":
+                    mode = prof.get("login_mode", "auto")
+                if mode == "blind":
+                    self._blind_login(username, password, encoding)
                     logged_in = True
-                self._raw_logged_write((reboot_command + "\n").encode(encoding))
-                # Wait for the reboot banner / autoboot window to open.
-                banner = self._wait_for_output(
-                    self._snapshot_len(), timeout=15.0, idle_timeout=0.8, terminator=None
-                )
-                seen += banner.decode(encoding, errors="replace")
-                if success_re.search(seen):
-                    return self._bootloader_success(seen)
-                # Device booted back to a login prompt instead of into autoboot:
-                # log in now so the next reboot works.
-                if (
-                    abort_re
-                    and abort_re.search(banner.decode(encoding, errors="replace"))
-                    and username
-                    and password
-                    and not logged_in
-                ):
-                    self._try_login(username, password, seen, encoding)
-                    logged_in = True
-                    continue  # next cycle reboots from the shell
-                time.sleep(max(delay, 0.0))
+                else:
+                    probe = self.send_command("", line_ending="cr", timeout=3.0, idle_timeout=0.5)
+                    seen += probe
+                    login_re = abort_re or re.compile(r"(login:|Login:)")
+                    if login_re.search(probe) or login_re.search(seen):
+                        logged_in = self._try_login(username, password, seen, encoding)
+                        if not logged_in:
+                            # Prompt detection read noise (busy console) —
+                            # fall back to blind typing on the next cycle.
+                            self._blind_login(username, password, encoding)
+                            logged_in = True
+            elif not logged_in and (not username or not password):
+                # No credentials: still allow interrupt-only flows (the user may
+                # be sitting at the bootloader already or power-cycling).
+                pass
 
-            # Paced interrupt tapping.
-            for key in keys * 1:
-                for _ in range(max_attempts):
-                    if time.monotonic() > deadline:
-                        return self._bootloader_failure(seen, deadline_hit=True)
-                    self._raw_logged_write(key.encode(encoding))
-                    out = self._wait_for_output(
-                        self._snapshot_len(), timeout=interval + 0.05, idle_timeout=0.02, terminator=None
+            if reboot or cycle > 1:
+                self._raw_logged_write((reboot_command + "\n").encode(encoding))
+
+            # Tap continuously *through* the boot. Short autoboot windows
+            # (e.g. "stop autoboot in 1 seconds") cannot be won by waiting for
+            # the banner first, so keys are sent from the moment reboot is
+            # issued and keep going until success or the attempt cap.
+            time.sleep(max(delay, 0.0))
+            taps = 0
+            while taps < max_attempts:
+                if time.monotonic() > deadline:
+                    return self._bootloader_failure(seen, deadline_hit=True)
+                self._raw_logged_write(keys[taps % len(keys)].encode(encoding))
+                taps += 1
+                out = self._wait_for_output(
+                    self._snapshot_len(), timeout=interval, idle_timeout=0.02, terminator=None
+                )
+                chunk = out.decode(encoding, errors="replace")
+                seen += chunk
+                if self._is_bootloader_prompt(seen, success_re):
+                    # Confirm the boot actually paused: if the device keeps
+                    # streaming Linux boot output, the prompt was a banner.
+                    settle = self._wait_for_output(
+                        self._snapshot_len(), timeout=2.0, idle_timeout=0.6, terminator=None
                     )
-                    seen += out.decode(encoding, errors="replace")
-                    if success_re.search(seen):
+                    settle_text = settle.decode(encoding, errors="replace")
+                    seen += settle_text
+                    if not self._LINUX_RESUMED_RE.search(settle_text):
                         return self._bootloader_success(seen)
-                if abort_re and abort_re.search(seen):
-                    break  # device booted to Linux; next cycle reboots
+                # If Linux clearly resumed, this attempt lost the window.
+                if self._LINUX_RESUMED_RE.search(chunk):
+                    break
+                if not reboot:
+                    # No reboot requested: nothing new will appear, so a short
+                    # attempt budget is enough.
+                    continue
 
         return self._bootloader_failure(seen, deadline_hit=time.monotonic() > deadline)
+
+    # Signals that the OS actually resumed: matching success text alone is not
+    # proof of a bootloader prompt (banner text, shutdown chatter and
+    # "press Enter" console messages all contain similar words).
+    # Signals that the OS actually came back up. Deliberately excludes shutdown
+    # chatter (uloop_done, app-classifier stop, procd stopping services): those
+    # appear *before* the reboot and must not abort the interrupt attempt, or
+    # tapping stops seconds before the autoboot window opens.
+    _LINUX_RESUMED_RE = re.compile(
+        r"(Linux version \d|Kernel command line:|Freeing unused kernel|"
+        r"Starting kernel \.\.\.|Run /sbin/init|procd: (Running|init))",
+        re.IGNORECASE,
+    )
+
+    # A bootloader *banner* is printed on every boot, so seeing it proves
+    # nothing. Only an interactive prompt (or a paused boot) counts.
+    _BANNER_ONLY_RE = re.compile(r"^(U-Boot|uboot)[^\n]*\(.*\)\s*$|^U-Boot [0-9]", re.M)
+
+    def _is_bootloader_prompt(self, seen: str, success_re: re.Pattern[str]) -> bool:
+        """True only if the boot actually stopped at the bootloader.
+
+        The banner alone is not evidence (it prints on every boot), so success is
+        only claimed for an interactive prompt marker, and only while Linux has
+        not started after it.
+        """
+        match = success_re.search(seen)
+        if not match:
+            return False
+        matched = match.group(0)
+        if self._BANNER_ONLY_RE.match(matched.strip()):
+            return False
+        after = seen[match.end():]
+        return not self._LINUX_RESUMED_RE.search(after)
 
     def _bootloader_success(self, seen: str) -> str:
         return "Entered bootloader.\n\nTail of output:\n" + seen[-400:]
@@ -910,6 +1015,7 @@ def enter_bootloader(
     max_attempts: int | None = None,
     login_username: str | None = None,
     login_password: str | None = None,
+    login_mode: str = "auto",
     overall_timeout: float = 120.0,
     encoding: str = "utf-8",
 ) -> str:
@@ -938,13 +1044,17 @@ def enter_bootloader(
         login_username: Explicit username (overrides profile/credentials).
         login_password: Explicit password (overrides profile/credentials;
             prefer set_boot_credentials so secrets stay out of logs).
+        login_mode: "auto" detects prompts and falls back to blind typing;
+            "blind" skips all prompt verification and fires Enter, username,
+            password on a fixed schedule. Use "blind" on consoles flooded with
+            unsolicited logging, where prompt detection reads noise.
         overall_timeout: Wall-clock cap in seconds for the entire operation.
         encoding: Text encoding for the serial stream.
     """
     return state.enter_bootloader(
         profile, interrupt_keys, success_regex, abort_regex, reboot,
         reboot_command, delay, interval, max_attempts,
-        login_username, login_password, overall_timeout, encoding,
+        login_username, login_password, login_mode, overall_timeout, encoding,
     )
 
 
