@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import json
 import socket
+import sys
 import threading
 import time
 import errno
@@ -75,6 +76,54 @@ BUILTIN_BOOT_PROFILES = {
 CONFIG_DIR = Path(os.environ.get("SERIAL_MCP_CONFIG", "~/.config/serial-mcp")).expanduser()
 USER_PROFILES_PATH = CONFIG_DIR / "profiles.json"
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
+
+# Startup configuration: if a default port is configured, the server connects
+# and serves the session the moment the MCP process starts — no AI action
+# needed. File keys: port, baudrate, timeout, prompt_regex, session_socket.
+# SERIAL_MCP_* environment variables override the file.
+DEFAULT_CONFIG_PATH = CONFIG_DIR / "config.json"
+_CONFIG_KEYS = ("port", "baudrate", "timeout", "prompt_regex", "session_socket")
+_ENV_OVERRIDES = {
+    "port": "SERIAL_MCP_PORT",
+    "baudrate": "SERIAL_MCP_BAUDRATE",
+    "timeout": "SERIAL_MCP_TIMEOUT",
+    "prompt_regex": "SERIAL_MCP_PROMPT_REGEX",
+    "session_socket": "SERIAL_MCP_SESSION_SOCKET",
+}
+
+
+def _load_startup_config() -> dict:
+    """Merge config file with SERIAL_MCP_* environment overrides (env wins)."""
+    file_cfg = _load_json_file(DEFAULT_CONFIG_PATH)
+    cfg = {k: v for k, v in file_cfg.items() if k in _CONFIG_KEYS and v not in (None, "")}
+    for key, var in _ENV_OVERRIDES.items():
+        value = os.environ.get(var)
+        if value:
+            cfg[key] = value
+    return cfg
+
+
+def _auto_connect_from_config() -> str | None:
+    """Connect at server startup when a default port is configured.
+
+    This is what makes the terminal watchable before the AI does anything:
+    the session socket and companion pty exist as soon as the MCP server is
+    up, so the user can attach (tio, screen, nc) immediately and keep that
+    attach across every later AI connect/reconnect.
+    """
+    cfg = _load_startup_config()
+    if not cfg.get("port"):
+        return None
+    result = state.connect(
+        cfg["port"],
+        baudrate=int(cfg.get("baudrate", 115200)),
+        timeout=float(cfg.get("timeout", 0.1)),
+        prompt_regex=cfg.get("prompt_regex"),
+        session_socket=cfg.get("session_socket", SESSION_SOCKET_AUTO),
+    )
+    # stderr only: stdout is the MCP transport.
+    print(f"[serial-mcp] startup connect: {result}", file=sys.stderr)
+    return result
 
 
 def _load_json_file(path: Path) -> dict:
@@ -227,47 +276,95 @@ class SerialState:
         prompt_regex: str | None = None,
         session_socket: str | None = SESSION_SOCKET_AUTO,
     ) -> str:
-        """Open the serial device and serve a tio-protocol session socket."""
+        """Open the serial device and serve a tio-protocol session socket.
+
+        If the session socket is already running at the requested path, it is
+        kept alive across the (re)connect so an attached user's tio/screen
+        session survives AI connects, reconnects, and baudrate changes.
+        """
         try:
             prompt_pattern = self._compile_optional_regex(prompt_regex)
 
-            if self.ser and self.ser.is_open:
-                self.disconnect()
+            if session_socket == SESSION_SOCKET_AUTO:
+                session_socket = _session_socket_for_port(port)
 
-            self.ser = serial.Serial(port, baudrate, timeout=timeout)
-            self.prompt_pattern = prompt_pattern
-            with self.buffer_lock:
-                self.buffer = b""
-            self.log_rx_buffer = ""
-            self.log_rx_last_update = None
-            self.io_history.clear()
+            keep_session = (
+                bool(session_socket)
+                and self.session_running.is_set()
+                and self.session_path == session_socket
+            )
+            same_port = (
+                self.ser is not None
+                and self.ser.is_open
+                and getattr(self.ser, "port", None) == port
+                and int(getattr(self.ser, "baudrate", 0) or 0) == int(baudrate)
+            )
 
-            self.stop_event.clear()
-            self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self.reader_thread.start()
+            if same_port:
+                # The device link is unchanged: keep the port (and the live
+                # session) instead of bouncing it on every AI connect.
+                if not keep_session:
+                    self._stop_session()
+                self.prompt_pattern = prompt_pattern
+                with self.buffer_lock:
+                    self.buffer = b""
+                self.log_rx_buffer = ""
+                self.log_rx_last_update = None
+                self.io_history.clear()
+                if self.reader_thread is None:
+                    self.stop_event.clear()
+                    self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+                    self.reader_thread.start()
+            else:
+                if not keep_session:
+                    self._stop_session()
+                self._stop_reader()
+                self._flush_rx_log_buffer(force=True)
+                if self.ser is not None:
+                    try:
+                        self.ser.close()
+                    except Exception:
+                        pass
+                    self.ser = None
+
+                self.ser = serial.Serial(port, baudrate, timeout=timeout)
+                self.prompt_pattern = prompt_pattern
+                with self.buffer_lock:
+                    self.buffer = b""
+                self.log_rx_buffer = ""
+                self.log_rx_last_update = None
+                self.io_history.clear()
+
+                self.stop_event.clear()
+                self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+                self.reader_thread.start()
 
             self._log("SYS", f"Connected to {port} @ {baudrate}")
             result = f"Connected to {port} at {baudrate} baud."
-            if session_socket == SESSION_SOCKET_AUTO:
-                session_socket = _session_socket_for_port(port)
             if session_socket:
-                session_result = self._start_session(session_socket)
-                if session_result.startswith("Error"):
-                    self._log("WARN", session_result)
-                    result += f" (session socket unavailable: {session_result})"
+                if not self.session_running.is_set():
+                    session_result = self._start_session(session_socket)
+                    if session_result.startswith("Error"):
+                        self._log("WARN", session_result)
+                        result += f" (session socket unavailable: {session_result})"
+                    else:
+                        result += " " + _attach_hint(session_result)
                 else:
-                    result += " " + _attach_hint(session_result)
+                    result += " " + _attach_hint(self.session_path)
             return result
         except Exception as e:
             self._log("ERR", f"Connect failed: {e}")
             return f"Error connecting to {port}: {e}"
 
-    def disconnect(self) -> str:
-        self._stop_session()
+    def _stop_reader(self) -> None:
         self.stop_event.set()
         if self.reader_thread:
             self.reader_thread.join(timeout=2.0)
             self.reader_thread = None
+
+    def disconnect(self) -> str:
+        self._stop_session()
+        self._stop_reader()
 
         self._flush_rx_log_buffer(force=True)
 
@@ -879,8 +976,10 @@ class SerialState:
     def tio_info(self) -> str:
         if self.ser is None or not self.ser.is_open:
             return (
-                "Not connected. Call connect(port=...) to open the device; a session "
-                "socket starts automatically, then you can attach from your terminal."
+                "Not connected. The session socket/pty appears here as soon as a "
+                "device is open: set a default port in "
+                f"{DEFAULT_CONFIG_PATH} (or SERIAL_MCP_PORT) so the server connects "
+                "at startup, or call connect(port=...)."
             )
         if not self.session_running.is_set() or not self.session_path:
             return (
@@ -890,7 +989,7 @@ class SerialState:
         with self.session_lock:
             count = len(self.session_clients)
         return (
-            f"AI holds the device ({self.ser.port}); {count} client(s) attached.\n"
+            f"Device {self.ser.port} is held by this MCP session; {count} client(s) attached.\n"
             + _attach_hint(self.session_path)
         )
 
@@ -910,7 +1009,8 @@ def connect(
 
     The AI holds the device; the user attaches to the session from their own
     terminal (any tty tool on the companion pty, or nc -UN) using tio's raw-byte socket
-    protocol.
+    protocol. Calling this while a session is already running keeps that session
+    (and anyone attached to it) alive; only the device link is (re)opened.
 
     Args:
         port: Serial device path, for example /dev/ttyUSB0.
@@ -1085,6 +1185,10 @@ def tio_info() -> str:
 
 def main() -> None:
     """Entry point for the serial-mcp console script (uvx/pip installs)."""
+    # Bring the session up before serving MCP, if a default port is configured:
+    # the terminal is then watchable (tio, screen, nc) whether or not the AI
+    # ever calls connect, and the user's attach survives later AI connects.
+    _auto_connect_from_config()
     mcp.run()
 
 

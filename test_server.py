@@ -372,6 +372,86 @@ def test_tio_info_when_not_connected():
     assert state.tio_info().startswith("Not connected")
 
 
+def test_ai_reconnect_keeps_session_and_attached_client():
+    """The user attaches first; a later AI connect must not drop them."""
+
+    def handler(master, stop):
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                os.read(master, 1024)
+                os.write(master, b"tick")
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(_session_path(port))
+        client.settimeout(2.0)
+        time.sleep(0.1)
+
+        # AI calls connect again (same device, same session path).
+        result = state.connect(port)
+        assert result.startswith("Connected"), result
+        assert os.path.exists(_session_path(port))
+
+        # The attach survived: typing still reaches the device and RX still
+        # flows back to this client.
+        client.sendall(b"x")
+        buf = b""
+        deadline = time.monotonic() + 2.0
+        while b"tick" not in buf and time.monotonic() < deadline:
+            try:
+                chunk = client.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+        assert b"tick" in buf
+        client.close()
+    finally:
+        _cleanup(master, slave, stop, thread)
+        if os.path.exists(_session_path(port)):
+            os.unlink(_session_path(port))
+
+
+def test_startup_config_env_overrides_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "DEFAULT_CONFIG_PATH", tmp_path / "config.json")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"port": "/dev/ttyUSB9", "baudrate": 9600, "junk": 1})
+    )
+    monkeypatch.setenv("SERIAL_MCP_PORT", "/dev/ttyUSB7")
+    for var in ("SERIAL_MCP_BAUDRATE", "SERIAL_MCP_TIMEOUT", "SERIAL_MCP_PROMPT_REGEX", "SERIAL_MCP_SESSION_SOCKET"):
+        monkeypatch.delenv(var, raising=False)
+
+    cfg = server._load_startup_config()
+    assert cfg["port"] == "/dev/ttyUSB7"  # env wins
+    assert cfg["baudrate"] == 9600  # untouched key from file
+    assert "junk" not in cfg
+
+
+def test_auto_connect_from_config_connects_to_configured_port(monkeypatch):
+    calls = {}
+
+    def fake_connect(port, **kwargs):
+        calls["port"] = port
+        calls.update(kwargs)
+        return f"Connected to {port} at {kwargs.get('baudrate')} baud."
+
+    monkeypatch.setattr(server, "_load_startup_config", lambda: {"port": "/dev/ttyUSB3", "baudrate": 57600})
+    monkeypatch.setattr(server.state, "connect", fake_connect)
+
+    assert server._auto_connect_from_config().startswith("Connected")
+    assert calls["port"] == "/dev/ttyUSB3"
+    assert calls["baudrate"] == 57600
+
+
+def test_auto_connect_from_config_is_noop_without_port(monkeypatch):
+    monkeypatch.setattr(server, "_load_startup_config", lambda: {})
+    assert server._auto_connect_from_config() is None
+
+
 def test_reader_eio_on_active_connection_warns_once_and_marks_unavailable():
     class _EIOSerial:
         is_open = True
