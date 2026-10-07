@@ -741,15 +741,101 @@ def test_login_reports_rejection(boot_creds):
 
 def test_login_blind_mode_does_not_leak_password(boot_creds):
     state.set_boot_credentials("mydevice", "root", "sekrit")
+    (boot_creds / "profiles.json").write_text(json.dumps({
+        "mydevice": {"login": {"username": "root", "password_ref": "mydevice"}}
+    }))
 
     master, slave, port, stop, thread = _pty_device(_login_device_handler())
     try:
         _connect(port)
-        state.login(profile="mydevice", login_mode="blind")
+        result = state.login(profile="mydevice", login_mode="blind")
+        assert not result.startswith("Error"), result
         assert "sekrit" not in Path(state.log_path).read_text(encoding="utf-8")
         assert "[redacted]" in Path(state.log_path).read_text(encoding="utf-8")
     finally:
         _cleanup(master, slave, stop, thread)
+
+
+def test_login_blind_reports_success_when_prompt_is_delayed(boot_creds):
+    """A login that works must not be reported as a failure.
+
+    Real consoles emit a banner in bursts: output goes quiet mid-stream, so a
+    single idle-bounded read returns before the shell prompt appears. That made
+    a successful login look like "no shell prompt was observed".
+    """
+    state.set_boot_credentials("mydevice", "root", "sekrit")
+    (boot_creds / "profiles.json").write_text(json.dumps({
+        "mydevice": {"login": {"username": "root", "password_ref": "mydevice"}}
+    }))
+
+    def handler(master, stop):
+        seen_pw = False
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                data = os.read(master, 1024)
+                if b"sekrit" in data:
+                    seen_pw = True
+                if seen_pw and b"echo" not in data:
+                    continue
+            if seen_pw:
+                # Banner in two bursts, separated by a long quiet patch, then
+                # the prompt -- the quiet patch must not end the wait.
+                os.write(master, b"BANNER-PART-1\r\n")
+                time.sleep(1.2)
+                os.write(master, b"BANNER-PART-2\r\n")
+                time.sleep(0.9)
+                os.write(master, b"root@device:~# ")
+                return
+            time.sleep(0.01)
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        result = state.login(profile="mydevice", login_mode="blind", overall_timeout=10.0)
+        assert result.startswith("Logged in"), result
+        assert "sekrit" not in Path(state.log_path).read_text(encoding="utf-8")
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_login_blind_reports_rejection_not_success(boot_creds):
+    """Console chatter ending in '#' must not be mistaken for a shell prompt."""
+    state.set_boot_credentials("mydevice", "root", "sekrit")
+    (boot_creds / "profiles.json").write_text(json.dumps({
+        "mydevice": {"login": {"username": "root", "password_ref": "mydevice"}}
+    }))
+
+    def handler(master, stop):
+        seen_pw = False
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                data = os.read(master, 1024)
+                if b"sekrit" in data:
+                    seen_pw = True
+            if seen_pw:
+                os.write(master, b"Login incorrect\r\n")
+                os.write(master, b"some chatter ending in #\r\n")
+                os.write(master, b"test-device login: ")
+                return
+            time.sleep(0.01)
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        result = state.login(profile="mydevice", login_mode="blind", overall_timeout=6.0)
+        assert result.startswith("Login rejected"), result
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_shell_prompt_regex_ignores_console_chatter():
+    assert state._SHELL_PROMPT_RE.search("root@dev:~# ")
+    assert state._SHELL_PROMPT_RE.search("admin@host:/tmp$ ")
+    assert state._SHELL_PROMPT_RE.search("\n# ")
+    for chatter in ("Login incorrect", "Password: ", "dev login: ", "--> # ", "switch# "):
+        assert not state._SHELL_PROMPT_RE.search(chatter), chatter
 
 
 def test_login_error_paths(boot_creds):

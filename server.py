@@ -749,6 +749,53 @@ class SerialState:
                 return True
         return True
 
+    def _poll_for_login_outcome(
+        self,
+        start: int,
+        deadline: float,
+        encoding: str,
+        interval: float = 0.5,
+        idle_timeout: float = 0.5,
+    ) -> tuple[str, str]:
+        """Read until a shell prompt or a rejection appears, or the deadline passes.
+
+        `start` is a buffer offset (see _snapshot_len) captured *before* the login
+        was typed, so output that arrived while typing is included rather than
+        skipped — a device that answers during a typing pause would otherwise be
+        judged as silent.
+
+        A single idle-bounded read is not enough either: the console may pause
+        mid-stream (boot banners scroll in bursts, a shell can take a moment to
+        spawn), so returning on the first quiet patch reports a false negative
+        for a login that actually succeeded. Poll instead, keeping every chunk,
+        and stop early on a definitive result.
+
+        Returns (accumulated_text, outcome) where outcome is one of
+        "prompt", "rejected" or "unknown".
+        """
+        chunks: list[str] = []
+        first = True
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            offset = start if first else self._snapshot_len()
+            first = False
+            chunk = self._wait_for_output(
+                offset,
+                timeout=min(interval, remaining),
+                idle_timeout=min(idle_timeout, remaining),
+                terminator=None,
+            ).decode(encoding, errors="replace")
+            if chunk:
+                chunks.append(chunk)
+            text = "".join(chunks)
+            if self._LOGIN_FAILED_RE.search(text):
+                return text, "rejected"
+            if self._SHELL_PROMPT_RE.search(text):
+                return text, "prompt"
+        return "".join(chunks), "unknown"
+
     def login(
         self,
         profile: str | None = None,
@@ -791,16 +838,17 @@ class SerialState:
             mode = prof.get("login_mode", "auto")
 
         if mode == "blind":
-            # Blind typing is open-loop by design: we cannot verify the prompt,
-            # only observe what arrives afterwards.
+            # Blind typing is open-loop: nothing is verified at send time, so the
+            # outcome is judged only from what arrives afterwards — and that
+            # judging must include output produced while typing, not just after.
+            attempt_start = self._snapshot_len()
             self._blind_login(username, password, encoding)
-            tail = self._wait_for_output(
-                self._snapshot_len(), timeout=max(float(overall_timeout), 1.0),
-                idle_timeout=0.8, terminator=None,
-            ).decode(encoding, errors="replace")
-            if self._LOGIN_FAILED_RE.search(tail):
+            tail, outcome = self._poll_for_login_outcome(
+                attempt_start, time.monotonic() + max(float(overall_timeout), 1.0), encoding
+            )
+            if outcome == "rejected":
                 return "Login rejected by the device (wrong credentials).\n\nTail of output:\n" + tail[-300:]
-            if self._SHELL_PROMPT_RE.search(tail):
+            if outcome == "prompt":
                 return "Logged in.\n\nTail of output:\n" + tail[-300:]
             return (
                 "Login typed blind and submitted, but no shell prompt was observed. "
@@ -846,7 +894,12 @@ class SerialState:
 
     _LOGIN_PASSWORD_RE = re.compile(r"password\s*:\s*$", re.IGNORECASE | re.M)
     _LOGIN_FAILED_RE = re.compile(r"(login|password) incorrect", re.IGNORECASE)
-    _SHELL_PROMPT_RE = re.compile(r"(^|\n)\s*[\w.-]+@[\w.-]+[:~][^\n]*[#$]\s*$|[#$]\s*$", re.M)
+    # A shell prompt is either the structured "user@host[:path]$" form, or a
+    # bare marker that *starts* a line (so console chatter ending in "#" or "$"
+    # mid-line is not mistaken for a prompt and reported as a false success).
+    _SHELL_PROMPT_RE = re.compile(
+        r"[\w.-]+@[\w.-]+[:~][^\n]*[#$]\s*$|^\s*[#$]\s*$", re.M
+    )
 
     def enter_bootloader(
         self,
