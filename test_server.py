@@ -243,8 +243,9 @@ def test_no_direct_attach_tools_exposed():
         "list_boot_profiles",
         "set_boot_credentials",
         "enter_bootloader",
+        "login",
     }
-    forbidden = {"connect_via_tio", "login", "logout", "enter_cli_mode", "check_mode"}
+    forbidden = {"connect_via_tio", "logout", "enter_cli_mode", "check_mode"}
     if hasattr(server.mcp, "get_tools"):
         actual = set(asyncio.run(server.mcp.get_tools()).keys())  # fastmcp 2.x
     else:
@@ -672,3 +673,94 @@ def test_enter_bootloader_unknown_profile_and_not_connected():
     assert state.enter_bootloader(profile="nope").startswith("Error: unknown boot profile")
     state.disconnect()
     assert state.enter_bootloader().startswith("Error: Not connected")
+
+
+def _login_device_handler(password=b"sekrit", wrong=False):
+    """Fake getty: prompts for login, then Password, then a shell/nak."""
+    def handler(master, stop):
+        buf = b""
+        stage = "login"
+        last_prompt = 0.0
+        while not stop.is_set():
+            # getty re-prompts until someone answers (and survives pyserial's
+            # open-time flush of pending input).
+            if stage == "login" and time.monotonic() - last_prompt > 0.3:
+                os.write(master, b"test-device login: ")
+                last_prompt = time.monotonic()
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                buf += os.read(master, 1024)
+                if stage == "login" and b"root" in buf:
+                    os.write(master, b"Password: ")
+                    stage, buf = "password", b""
+                elif stage == "password" and password in buf:
+                    if wrong:
+                        os.write(master, b"Login incorrect\r\ntest-device login: ")
+                        stage, buf = "login", b""
+                    else:
+                        os.write(master, b"root@dev:~# ")
+                        stage, buf = "shell", b""
+            time.sleep(0.01)
+    return handler
+
+
+def test_login_logs_in_and_redacts_the_password(boot_creds):
+    state.set_boot_credentials("mydevice", "root", "sekrit")
+    (boot_creds / "profiles.json").write_text(json.dumps({
+        "mydevice": {"login": {"username": "root", "password_ref": "mydevice"}}
+    }))
+
+    master, slave, port, stop, thread = _pty_device(_login_device_handler())
+    try:
+        _connect(port)
+        result = state.login(profile="mydevice")
+        assert "Logged in" in result, result
+        # The secret must never appear in the transcript or the log file.
+        assert "sekrit" not in state.view_io(lines=100)
+        assert "[redacted]" in state.view_io(lines=100)
+        assert "sekrit" not in Path(state.log_path).read_text(encoding="utf-8")
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_login_reports_rejection(boot_creds):
+    state.set_boot_credentials("mydevice", "root", "sekrit")
+    (boot_creds / "profiles.json").write_text(json.dumps({
+        "mydevice": {"login": {"username": "root", "password_ref": "mydevice"}}
+    }))
+
+    master, slave, port, stop, thread = _pty_device(_login_device_handler(wrong=True))
+    try:
+        _connect(port)
+        result = state.login(profile="mydevice")
+        assert result.startswith("Login rejected"), result
+        assert "sekrit" not in Path(state.log_path).read_text(encoding="utf-8")
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_login_blind_mode_does_not_leak_password(boot_creds):
+    state.set_boot_credentials("mydevice", "root", "sekrit")
+
+    master, slave, port, stop, thread = _pty_device(_login_device_handler())
+    try:
+        _connect(port)
+        state.login(profile="mydevice", login_mode="blind")
+        assert "sekrit" not in Path(state.log_path).read_text(encoding="utf-8")
+        assert "[redacted]" in Path(state.log_path).read_text(encoding="utf-8")
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_login_error_paths(boot_creds):
+    state.disconnect()
+    assert state.login(profile="generic").startswith("Error: Not connected")
+
+    master, slave, port, stop, thread = _pty_device(lambda m, s: select.select([m], [], [], 0.05))
+    try:
+        _connect(port)
+        # Connected, but no usable credentials: both error paths are reachable.
+        assert state.login(profile="nope").startswith("Error: unknown profile")
+        assert state.login().startswith("Error: no credentials")
+    finally:
+        _cleanup(master, slave, stop, thread)

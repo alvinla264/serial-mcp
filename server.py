@@ -696,16 +696,25 @@ class SerialState:
         self._redacted_write((password + "\n").encode(encoding))
         time.sleep(settle)
 
-    def _try_login(self, username: str, password: str, seen: str, encoding: str) -> bool:
+    def _try_login(self, username: str, password: str, seen: str, encoding: str, transcript: list | None = None) -> bool:
         """Complete a login if a login prompt is visible.
 
         Polls for the "Password:" prompt (gives up if the device never asks),
         then submits the password without logging it. Wakes the console with a
         CR first because the prompt often only appears after a keypress.
+
+        When `transcript` is supplied, every chunk this method consumes is
+        appended to it, so callers can report *why* a login failed (the chunks
+        are consumed from the shared buffer and are otherwise unavailable).
         """
+        def note(text: str) -> str:
+            if transcript is not None:
+                transcript.append(text)
+            return text
+
         self._raw_logged_write(b"\r")
         out = self._wait_for_output(self._snapshot_len(), timeout=2.0, idle_timeout=0.5, terminator=None)
-        seen += out.decode(encoding, errors="replace")
+        seen += note(out.decode(encoding, errors="replace"))
         if not re.search(r"login:", seen, re.IGNORECASE):
             return False
 
@@ -716,7 +725,7 @@ class SerialState:
             out = self._wait_for_output(
                 self._snapshot_len(), timeout=1.0, idle_timeout=0.3, terminator=None
             )
-            chunk = out.decode(encoding, errors="replace")
+            chunk = note(out.decode(encoding, errors="replace"))
             seen += chunk
             if re.search(r"password", chunk, re.IGNORECASE):
                 got_password = True
@@ -732,13 +741,112 @@ class SerialState:
             out = self._wait_for_output(
                 self._snapshot_len(), timeout=1.0, idle_timeout=0.5, terminator=None
             )
-            chunk = out.decode(encoding, errors="replace")
+            chunk = note(out.decode(encoding, errors="replace"))
             seen += chunk
-            if re.search(r"Login incorrect", chunk):
+            if re.search(r"(login|password) incorrect", chunk, re.IGNORECASE):
                 return False
             if re.search(r"(root@|#\s*$|\$\s*$)", chunk):
                 return True
         return True
+
+    def login(
+        self,
+        profile: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        login_mode: str = "auto",
+        overall_timeout: float = 20.0,
+        encoding: str = "utf-8",
+    ) -> str:
+        """Log in to a shell console, without rebooting or entering U-Boot.
+
+        Credentials resolve exactly like enter_bootloader's: explicit arguments
+        win, else the profile's login section, else the local credentials file.
+        The password is only ever submitted through _redacted_write, so it never
+        appears in the log file or the view_io transcript.
+        """
+        if not self.ser or not self.ser.is_open:
+            return "Error: Not connected to a serial port."
+
+        prof = self._merged_boot_profiles().get(profile or "", {})
+        if profile and not prof:
+            return (
+                f"Error: unknown profile '{profile}'. See list_boot_profiles; "
+                f"user profiles live in {USER_PROFILES_PATH}."
+            )
+        login_cfg = prof.get("login") or {}
+        cred_key = login_cfg.get("password_ref") or profile
+        creds = _load_json_file(CREDENTIALS_PATH).get(cred_key, {}) if cred_key else {}
+        username = username or login_cfg.get("username") or creds.get("username")
+        password = password or creds.get("password")
+        if not username or not password:
+            return (
+                "Error: no credentials available. Pass a profile with a login section "
+                "whose password_ref has been stored via set_boot_credentials, or supply "
+                "username/password explicitly."
+            )
+
+        mode = login_mode
+        if mode == "auto":
+            mode = prof.get("login_mode", "auto")
+
+        if mode == "blind":
+            # Blind typing is open-loop by design: we cannot verify the prompt,
+            # only observe what arrives afterwards.
+            self._blind_login(username, password, encoding)
+            tail = self._wait_for_output(
+                self._snapshot_len(), timeout=max(float(overall_timeout), 1.0),
+                idle_timeout=0.8, terminator=None,
+            ).decode(encoding, errors="replace")
+            if self._LOGIN_FAILED_RE.search(tail):
+                return "Login rejected by the device (wrong credentials).\n\nTail of output:\n" + tail[-300:]
+            if self._SHELL_PROMPT_RE.search(tail):
+                return "Logged in.\n\nTail of output:\n" + tail[-300:]
+            return (
+                "Login typed blind and submitted, but no shell prompt was observed. "
+                "The console may be flooded with logging, or the prompt differs from "
+                "the expected pattern; check read_output/view_io.\n\nTail of output:\n"
+                + tail[-300:]
+            )
+
+        # Prompt-driven login. If the console is already sitting at "Password:",
+        # the username is in; sending it again would be read as the password.
+        seen = self._wait_for_output(
+            self._snapshot_len(), timeout=1.5, idle_timeout=0.3, terminator=None
+        ).decode(encoding, errors="replace")
+        if self._LOGIN_FAILED_RE.search(seen):
+            return "Login rejected by the device (wrong credentials).\n\nTail of output:\n" + seen[-300:]
+        if self._SHELL_PROMPT_RE.search(seen):
+            return "Already logged in.\n\nTail of output:\n" + seen[-300:]
+
+        if self._LOGIN_PASSWORD_RE.search(seen):
+            self._redacted_write((password + "\n").encode(encoding))
+            tail = self._wait_for_output(
+                self._snapshot_len(), timeout=max(float(overall_timeout), 1.0),
+                idle_timeout=0.8, terminator=None,
+            ).decode(encoding, errors="replace")
+            landed = bool(self._SHELL_PROMPT_RE.search(tail)) and not self._LOGIN_FAILED_RE.search(tail)
+        else:
+            # _try_login drives the prompt handshake itself and reports whether
+            # it reached a shell; it consumes the output it inspects, so ask it
+            # to hand that text back for accurate failure reporting.
+            consumed: list[str] = []
+            landed = self._try_login(username, password, seen, encoding, transcript=consumed)
+            tail = "".join(consumed)
+
+        if landed:
+            return "Logged in.\n\nTail of output:\n" + (tail or seen)[-300:]
+        if self._LOGIN_FAILED_RE.search(tail) or self._LOGIN_FAILED_RE.search(seen):
+            return "Login rejected by the device (wrong credentials).\n\nTail of output:\n" + (tail or seen)[-300:]
+        return (
+            "Login did not reach a shell. The credentials may be wrong, the console "
+            "may be busy, or the prompt differs from the expected pattern; check "
+            "read_output/view_io.\n\nTail of output:\n" + (tail or seen)[-300:]
+        )
+
+    _LOGIN_PASSWORD_RE = re.compile(r"password\s*:\s*$", re.IGNORECASE | re.M)
+    _LOGIN_FAILED_RE = re.compile(r"(login|password) incorrect", re.IGNORECASE)
+    _SHELL_PROMPT_RE = re.compile(r"(^|\n)\s*[\w.-]+@[\w.-]+[:~][^\n]*[#$]\s*$|[#$]\s*$", re.M)
 
     def enter_bootloader(
         self,
@@ -1096,6 +1204,38 @@ def set_boot_credentials(profile_key: str, username: str, password: str) -> str:
         password: Login password (stored locally only; redacted in logs).
     """
     return state.set_boot_credentials(profile_key, username, password)
+
+
+@mcp.tool()
+def login(
+    profile: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    login_mode: str = "auto",
+    overall_timeout: float = 20.0,
+    encoding: str = "utf-8",
+) -> str:
+    """Log in to the device's shell console (no reboot, no bootloader entry).
+
+    Credentials resolve like enter_bootloader's: explicit arguments win, else the
+    profile's login section, else the local credentials file. The password is
+    always written through the redacting path, so it never reaches the log file
+    or the view_io transcript — prefer a profile + set_boot_credentials over
+    passing a secret as an argument.
+
+    Args:
+        profile: Profile whose login section provides username/password_ref
+            (see list_boot_profiles).
+        username: Explicit username (overrides profile/credentials).
+        password: Explicit password (overrides profile/credentials; prefer stored
+            credentials so the secret stays out of call arguments).
+        login_mode: "auto" detects the login/password prompts; "blind" types
+            Enter, username, password on a schedule, for consoles flooded with
+            unsolicited logging where prompt detection reads noise.
+        overall_timeout: Wall-clock cap in seconds for the whole login.
+        encoding: Text encoding for the serial stream.
+    """
+    return state.login(profile, username, password, login_mode, overall_timeout, encoding)
 
 
 @mcp.tool()
