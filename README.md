@@ -3,10 +3,10 @@
 Small FastMCP server that exposes a generic serial transport. It does not assume a
 specific device, shell, login flow, prompt, or command language.
 
-**The session is always up.** The MCP server opens the configured serial device
-and serves a session socket as soon as the process starts — no AI action needed.
-The AI can attach to that same session, but you never have to wait for it: attach
-from your own terminal first and watch the console live, then let the AI join.
+**The AI opens the device; you attach to its session.** The session socket and
+companion pty exist while a connection is open, so you can watch or type from
+your own terminal at the same time. The device is opened only when the AI calls
+`connect` — never automatically at startup.
 
 Repo: https://github.com/alvinla264/serial-mcp
 
@@ -54,8 +54,7 @@ tip is re-resolved on each start.
         "--from",
         "git+https://github.com/alvinla264/serial-mcp",
         "serial-mcp"
-      ],
-      "lifecycle": "eager"
+      ]
     }
   }
 }
@@ -143,61 +142,11 @@ Copilot Chat in agent mode and ask it to connect to the serial device.
 Then reload/restart the agent so it picks up the server, and just say
 "connect to the serial device".
 
-### Watch the console without asking the AI
-
-Set a default port once, and the session (socket + companion pty) is up for the
-whole life of the MCP server process — so `tio /tmp/serial-mcp-ttyUSB0` works
-before, during, and after any AI interaction.
-
-`~/.config/serial-mcp/config.json` (outside any repo, safe to commit nowhere):
-
-```json
-{
-  "port": "/dev/ttyUSB0",
-  "baudrate": 115200
-}
-```
-
-Or environment variables (these win over the file): `SERIAL_MCP_PORT`,
-`SERIAL_MCP_BAUDRATE`, `SERIAL_MCP_TIMEOUT`, `SERIAL_MCP_PROMPT_REGEX`,
-`SERIAL_MCP_SESSION_SOCKET`.
-
-For **pi**, keep the MCP server alive for the whole agent session so the serial
-session is up the moment pi starts:
-
-```json
-{
-  "mcpServers": {
-    "serial-mcp": {
-      "transport": "stdio",
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/alvinla264/serial-mcp", "serial-mcp"],
-      "env": { "SERIAL_MCP_PORT": "/dev/ttyUSB0" },
-      "lifecycle": "eager"
-    }
-  }
-}
-```
-
-Either way (`config.json` or env), the flow is:
-
-1. Start your agent (pi). The MCP server connects to `/dev/ttyUSB0` at once and
-   logs to `/tmp/serial-mcp.log`.
-2. `tio /tmp/serial-mcp-ttyUSB0` from your terminal — you see everything the
-   device prints, and your typing reaches it.
-3. Whenever you like, tell the AI "look at the serial device". Its `connect`
-   call keeps *your* session and attach alive (it only touches the device link),
-   so both of you see the same stream.
-
-Without a configured port, nothing is opened until the AI calls `connect`, and
-no pty exists to attach to.
-
 ### Share the session from your terminal
 
-1. With a default port configured, the session socket already exists — e.g.
-   `/tmp/serial-mcp-ttyUSB0.sock` (derived from the device name, so multiple
-   devices get unique sockets). Otherwise tell the AI to connect first: it calls
-   `connect(port="/dev/ttyUSB0")` and reports the same socket path.
+1. Tell the AI to connect: it calls `connect(port="/dev/ttyUSB0")` and reports
+   the session socket, e.g. `/tmp/serial-mcp-ttyUSB0.sock` (derived from the
+   device name, so multiple devices get unique sockets).
 2. Attach from your terminal with any tty tool on the companion pty:
 
        tio /tmp/serial-mcp-ttyUSB0        # or screen, minicom, cat/echo, ...
@@ -217,6 +166,12 @@ no pty exists to attach to.
 > Only one process can hold the serial device. If you already have tio open on
 > `/dev/ttyUSB0`, quit it first; if the AI holds it, attach to its session as
 > above instead of opening the port yourself.
+>
+> Run **one** agent session per serial device. Serial ports cannot be shared, and
+> each MCP server creates its session socket and pty at the same paths, so a
+> second server connecting to the same device would take those paths over from
+> the first. Agents that do not need the device are unaffected — nothing is
+> opened until `connect` is called.
 
 ## Tools
 
@@ -227,7 +182,6 @@ no pty exists to attach to.
   pass an explicit path or `""` to disable. `prompt_regex` is an optional
   default terminator regex for command completion. Calling it again for the
   same device reuses the existing session (and keeps anyone attached to it).
-  When a default port is configured (see below), this already ran at startup.
 - `disconnect()`: closes the port, stops the reader, and drops session clients.
 - `send_command(text, line_ending="lf", timeout=5.0, idle_timeout=0.2,
   terminator_regex=None, encoding="utf-8")`: sends `text` plus an explicit line

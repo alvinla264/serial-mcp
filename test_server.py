@@ -417,42 +417,6 @@ def test_ai_reconnect_keeps_session_and_attached_client():
             os.unlink(_session_path(port))
 
 
-def test_startup_config_env_overrides_file(monkeypatch, tmp_path):
-    monkeypatch.setattr(server, "DEFAULT_CONFIG_PATH", tmp_path / "config.json")
-    (tmp_path / "config.json").write_text(
-        json.dumps({"port": "/dev/ttyUSB9", "baudrate": 9600, "junk": 1})
-    )
-    monkeypatch.setenv("SERIAL_MCP_PORT", "/dev/ttyUSB7")
-    for var in ("SERIAL_MCP_BAUDRATE", "SERIAL_MCP_TIMEOUT", "SERIAL_MCP_PROMPT_REGEX", "SERIAL_MCP_SESSION_SOCKET"):
-        monkeypatch.delenv(var, raising=False)
-
-    cfg = server._load_startup_config()
-    assert cfg["port"] == "/dev/ttyUSB7"  # env wins
-    assert cfg["baudrate"] == 9600  # untouched key from file
-    assert "junk" not in cfg
-
-
-def test_auto_connect_from_config_connects_to_configured_port(monkeypatch):
-    calls = {}
-
-    def fake_connect(port, **kwargs):
-        calls["port"] = port
-        calls.update(kwargs)
-        return f"Connected to {port} at {kwargs.get('baudrate')} baud."
-
-    monkeypatch.setattr(server, "_load_startup_config", lambda: {"port": "/dev/ttyUSB3", "baudrate": 57600})
-    monkeypatch.setattr(server.state, "connect", fake_connect)
-
-    assert server._auto_connect_from_config().startswith("Connected")
-    assert calls["port"] == "/dev/ttyUSB3"
-    assert calls["baudrate"] == 57600
-
-
-def test_auto_connect_from_config_is_noop_without_port(monkeypatch):
-    monkeypatch.setattr(server, "_load_startup_config", lambda: {})
-    assert server._auto_connect_from_config() is None
-
-
 def test_reader_eio_on_active_connection_warns_once_and_marks_unavailable():
     class _EIOSerial:
         is_open = True

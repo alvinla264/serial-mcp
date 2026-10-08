@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 import json
 import socket
-import sys
 import threading
 import time
 import errno
@@ -76,54 +75,6 @@ BUILTIN_BOOT_PROFILES = {
 CONFIG_DIR = Path(os.environ.get("SERIAL_MCP_CONFIG", "~/.config/serial-mcp")).expanduser()
 USER_PROFILES_PATH = CONFIG_DIR / "profiles.json"
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
-
-# Startup configuration: if a default port is configured, the server connects
-# and serves the session the moment the MCP process starts — no AI action
-# needed. File keys: port, baudrate, timeout, prompt_regex, session_socket.
-# SERIAL_MCP_* environment variables override the file.
-DEFAULT_CONFIG_PATH = CONFIG_DIR / "config.json"
-_CONFIG_KEYS = ("port", "baudrate", "timeout", "prompt_regex", "session_socket")
-_ENV_OVERRIDES = {
-    "port": "SERIAL_MCP_PORT",
-    "baudrate": "SERIAL_MCP_BAUDRATE",
-    "timeout": "SERIAL_MCP_TIMEOUT",
-    "prompt_regex": "SERIAL_MCP_PROMPT_REGEX",
-    "session_socket": "SERIAL_MCP_SESSION_SOCKET",
-}
-
-
-def _load_startup_config() -> dict:
-    """Merge config file with SERIAL_MCP_* environment overrides (env wins)."""
-    file_cfg = _load_json_file(DEFAULT_CONFIG_PATH)
-    cfg = {k: v for k, v in file_cfg.items() if k in _CONFIG_KEYS and v not in (None, "")}
-    for key, var in _ENV_OVERRIDES.items():
-        value = os.environ.get(var)
-        if value:
-            cfg[key] = value
-    return cfg
-
-
-def _auto_connect_from_config() -> str | None:
-    """Connect at server startup when a default port is configured.
-
-    This is what makes the terminal watchable before the AI does anything:
-    the session socket and companion pty exist as soon as the MCP server is
-    up, so the user can attach (tio, screen, nc) immediately and keep that
-    attach across every later AI connect/reconnect.
-    """
-    cfg = _load_startup_config()
-    if not cfg.get("port"):
-        return None
-    result = state.connect(
-        cfg["port"],
-        baudrate=int(cfg.get("baudrate", 115200)),
-        timeout=float(cfg.get("timeout", 0.1)),
-        prompt_regex=cfg.get("prompt_regex"),
-        session_socket=cfg.get("session_socket", SESSION_SOCKET_AUTO),
-    )
-    # stderr only: stdout is the MCP transport.
-    print(f"[serial-mcp] startup connect: {result}", file=sys.stderr)
-    return result
 
 
 def _load_json_file(path: Path) -> dict:
@@ -1137,10 +1088,8 @@ class SerialState:
     def tio_info(self) -> str:
         if self.ser is None or not self.ser.is_open:
             return (
-                "Not connected. The session socket/pty appears here as soon as a "
-                "device is open: set a default port in "
-                f"{DEFAULT_CONFIG_PATH} (or SERIAL_MCP_PORT) so the server connects "
-                "at startup, or call connect(port=...)."
+                "Not connected. Call connect(port=...) to open the device; a session "
+                "socket starts automatically, then you can attach from your terminal."
             )
         if not self.session_running.is_set() or not self.session_path:
             return (
@@ -1377,11 +1326,14 @@ def tio_info() -> str:
 
 
 def main() -> None:
-    """Entry point for the serial-mcp console script (uvx/pip installs)."""
-    # Bring the session up before serving MCP, if a default port is configured:
-    # the terminal is then watchable (tio, screen, nc) whether or not the AI
-    # ever calls connect, and the user's attach survives later AI connects.
-    _auto_connect_from_config()
+    """Entry point for the serial-mcp console script (uvx/pip installs).
+
+    The device is opened only when the AI calls connect. Opening at startup
+    would race when several MCP servers run at once (one per agent session):
+    each would open the same port and create its own session socket and pty at
+    the same paths, so the last one to start would silently steal them from the
+    others.
+    """
     mcp.run()
 
 
