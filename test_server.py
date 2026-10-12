@@ -938,12 +938,39 @@ class FakeSessionOwner:
             except OSError:
                 pass
 
+    def wait_for_clients(self, count=1, timeout=2.0):
+        """Block until at least `count` clients have been accepted.
+
+        Attaching is asynchronous: the owner's accept loop may not have taken the
+        connection yet, so closing immediately can miss the very connection the
+        test means to drop. Waiting makes that deterministic instead of racy.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if len(self.clients) >= count:
+                    return True
+            time.sleep(0.02)
+        with self._lock:
+            return len(self.clients) >= count
+
+    def drop_all_clients(self):
+        """Close every accepted client connection, keeping the owner alive."""
+        with self._lock:
+            conns, self.clients = list(self.clients), []
+        for c in conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+
 
 def test_attach_joins_existing_session_and_exchanges_bytes():
     owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
     try:
         result = state.attach(attach_socket=owner.path)
         assert result.startswith("Attached"), result
+        assert owner.wait_for_clients(1)
 
         # AI -> device, through the owner.
         out = state.send_command("ping", timeout=1.0, idle_timeout=0.05)
@@ -1086,11 +1113,111 @@ def test_reader_stops_when_the_owner_closes_the_socket():
     owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
     try:
         state.attach(attach_socket=owner.path)
-        owner.close()  # owner goes away (closes every connection it accepted)
-        deadline = time.monotonic() + 3.0
+        # The owner's accept loop is asynchronous, and an earlier liveness probe
+        # also counts as a client, so wait for the *real* connection: probe +
+        # ours = 2 accepted clients for one attach.
+        assert owner.wait_for_clients(2), f"clients={len(owner.clients)}"
+        owner.drop_all_clients()
+        deadline = time.monotonic() + 5.0
         while state.transport is not None and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert state.transport is None
+        assert state.transport is None, "reader did not notice the owner closing"
         assert state.stop_event.is_set()
     finally:
         state.disconnect()
+        owner.close()
+
+
+# ---- refusing to steal a session or silently share a device -----------------
+#
+# ttys are not exclusive-open: pyserial opens a port another process already
+# holds, and the two then interleave bytes. And _start_session used to unlink a
+# live session socket before binding its own, which silently orphaned the
+# previous owner. Both must now fail loudly instead.
+
+
+def test_connect_refuses_to_steal_a_live_session_socket():
+    """A live session path must never be unlinked and taken over."""
+    owner = FakeSessionOwner("/tmp/serial-mcp-TESTSTEAL.sock")
+    try:
+        before_inode = os.stat(owner.path).st_ino
+
+        # An agent tries to own a *different* device but collides on the path.
+        result = state.connect(port="/dev/ttyDOESNOTEXIST0", session_socket=owner.path)
+
+        assert result.startswith("Error"), result
+        assert "already served" in result
+        # The owner's socket must be untouched: same inode, still live, still
+        # relaying to its device.
+        assert os.path.exists(owner.path)
+        assert os.stat(owner.path).st_ino == before_inode
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.connect(owner.path)
+        probe.close()
+        os.write(owner.device_master, b"still-mine")
+        # the device write must not raise: the owner still owns its pty
+    finally:
+        state.disconnect()
+        owner.close()
+
+
+def test_connect_does_not_destroy_session_on_failed_open(monkeypatch):
+    """If the port cannot be opened, session paths must not be created."""
+    path = "/tmp/serial-mcp-TESTNOOPEN.sock"
+    if os.path.exists(path):
+        os.unlink(path)
+    try:
+        result = state.connect(port="/dev/ttyDOESNOTEXIST1", session_socket=path)
+        assert result.startswith("Error"), result
+        assert not os.path.exists(path), "session socket created despite failed open"
+        assert state.transport is None
+        assert not state.session_running.is_set()
+    finally:
+        state.disconnect()
+
+
+def test_port_lock_blocks_a_second_owner(monkeypatch):
+    """Two servers must not both open the same device."""
+    import fcntl
+
+    master, slave = pty.openpty()
+    port = os.ttyname(slave)
+    lock_path = f"/tmp/serial-mcp-{os.path.basename(port)}.lock"
+    try:
+        # A different process holding the advisory lock stands in for a second
+        # server. flock is per-open-file-description, so an independent fd here
+        # is seen as a competing holder.
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        result = state.connect(port=port)
+        assert result.startswith("Error"), result
+        assert "already held" in result
+        assert state.transport is None
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        result2 = state.connect(port=port)
+        assert result2.startswith("Connected"), result2
+    finally:
+        state.disconnect()
+        if os.path.exists(lock_path):
+            os.unlink(lock_path)
+        os.close(master)
+        os.close(slave)
+
+
+def test_port_lock_is_released_on_disconnect():
+    master, slave = pty.openpty()
+    port = os.ttyname(slave)
+    try:
+        assert state.connect(port=port).startswith("Connected")
+        assert state._port_lock_fd is not None
+        state.disconnect()
+        assert state._port_lock_fd is None
+        # Re-taking it must succeed immediately (no stale lock).
+        assert state.connect(port=port).startswith("Connected")
+    finally:
+        state.disconnect()
+        os.close(master)
+        os.close(slave)

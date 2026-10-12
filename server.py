@@ -262,6 +262,10 @@ class SerialState:
         self.log_rx_last_update: float | None = None
         self.log_rx_idle_flush_interval = 0.1
 
+        # Advisory exclusive lock for the owned serial port (see _claim_port_lock)
+        self._port_lock_fd: int | None = None
+        self._port_lock_path: str | None = None
+
         # Session socket (tio raw-byte protocol): RX broadcast to all clients,
         # client bytes forwarded to the device.
         self.session_path: str | None = None
@@ -432,6 +436,29 @@ class SerialState:
                 and int(self.transport.baudrate or 0) == int(baudrate)
             )
 
+            # Refuse before opening anything if the session path is already
+            # served by someone else: unlinking it would break that session and
+            # leave its clients attached to a socket nobody serves.
+            if session_socket and not keep_session:
+                if os.path.exists(session_socket) and _socket_is_live(session_socket):
+                    return (
+                        f"Error: session socket {session_socket} is already served by "
+                        "another process (probably the user's tio, or another agent). "
+                        "Join it with attach(attach_socket=...), or pass a different "
+                        "session_socket path."
+                    )
+
+            # "Device busy" is not enforced by the OS for ttys: pyserial opens a
+            # port another process already holds, and the two then steal each
+            # other's bytes. Take an advisory lock so a second server fails
+            # loudly instead of silently sharing the device.
+            if not same_port and not self._claim_port_lock(port):
+                holder = self._port_lock_holder(port) or "another process"
+                return (
+                    f"Error: {port} is already held by {holder}. Attach to that "
+                    "session instead of opening the port again (see attach)."
+                )
+
             if same_port:
                 # The device link is unchanged: keep the port (and the live
                 # session) instead of bouncing it on every AI connect.
@@ -455,6 +482,12 @@ class SerialState:
                 self._close_transport()
 
                 self.transport = DirectTransport(port, baudrate, timeout)
+                if not self.transport.is_open:
+                    # Do not claim success, and do not create session paths, for
+                    # a device we did not actually open.
+                    self._close_transport()
+                    self._release_port_lock()
+                    raise OSError(f"could not open {port}")
                 self.prompt_pattern = prompt_pattern
                 with self.buffer_lock:
                     self.buffer = b""
@@ -568,6 +601,86 @@ class SerialState:
             "disconnect detaches this server without disturbing their session."
         )
 
+    def _claim_port_lock(self, port: str) -> bool:
+        """Take an advisory exclusive lock for a serial port.
+
+        ttys are not exclusive-open, so pyserial will happily open a port another
+        process already holds and the two will interleave bytes. flock on a
+        per-device lock file gives a hard, self-clearing refusal: the kernel drops
+        the lock when the holder exits, so a crashed server never blocks the port.
+
+        Returns True when the lock is held (by us or already by us).
+        """
+        import fcntl
+
+        if self._port_lock_path == port and self._port_lock_fd is not None:
+            return True
+
+        self._release_port_lock()
+        lock_path = f"/tmp/serial-mcp-{re.sub(r'[^A-Za-z0-9_.-]', '_', os.path.basename(port))}.lock"
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            # If the lock file cannot be created, do not block normal use; the
+            # live-session guard still prevents the worst case.
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass
+        self._port_lock_fd = fd
+        self._port_lock_path = port
+        return True
+
+    def _port_lock_holder(self, port: str) -> str | None:
+        """Read the pid recorded in the port's lock file, for error messages."""
+        lock_path = f"/tmp/serial-mcp-{re.sub(r'[^A-Za-z0-9_.-]', '_', os.path.basename(port))}.lock"
+        try:
+            with open(lock_path, encoding="utf-8") as f:
+                pid = f.read().strip()
+        except OSError:
+            return None
+        if not pid.isdigit():
+            return None
+        cmd = None
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except OSError:
+            pass
+        name = (cmd or "another process")[:80]
+        return f"pid {pid} ({name})" if cmd else f"pid {pid}"
+
+    def _release_port_lock(self) -> None:
+        import fcntl
+
+        fd, self._port_lock_fd = self._port_lock_fd, None
+        self._port_lock_path = None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        # The lock file is deliberately left in place. The kernel lock lives on
+        # the fd, not the path, so an empty leftover file is harmless, whereas
+        # unlinking it can race: another holder's fd would survive a fresh
+        # create-and-lock by a third process at the same path, letting two
+        # processes believe they own the device.
+
     def _close_transport(self) -> None:
         transport, self.transport = self.transport, None
         if transport is not None:
@@ -637,6 +750,7 @@ class SerialState:
 
         if self.transport is not None and self.transport.is_open:
             self._close_transport()
+            self._release_port_lock()
             if was_attach:
                 self._log("SYS", f"Detached from session socket {owner}")
                 return (
@@ -646,6 +760,7 @@ class SerialState:
             self._log("SYS", "Disconnected")
             return "Disconnected."
         self._close_transport()
+        self._release_port_lock()
         return "No active connection."
 
     def _compile_optional_regex(self, pattern: str | None) -> re.Pattern[bytes] | None:
@@ -745,6 +860,22 @@ class SerialState:
     # ---- session socket (tio raw-byte protocol) ------------------------
 
     def _start_session(self, path: str) -> str:
+        """Serve the tio-protocol session socket at `path`.
+
+        Refuses to take the path from a live session. A serial path is shared
+        state: if something is already listening there (another MCP server, or
+        the user's own tio), unlinking it and binding our own would silently
+        break that session — its clients would keep holding a socket nobody
+        serves, and the device would appear to work while relaying nothing.
+        """
+        if not (self.session_running.is_set() and self.session_path == path):
+            if os.path.exists(path) and _socket_is_live(path):
+                return (
+                    f"Error: session socket {path} is already being served by another "
+                    "process. Join it with attach instead of taking it over "
+                    "(connect(port=...) would otherwise steal it from its owner)."
+                )
+
         self._stop_session()
         try:
             if os.path.exists(path):
