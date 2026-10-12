@@ -170,9 +170,17 @@ Why this is usually better:
 - **The agent cannot lock you out.** It holds no port; `disconnect` only detaches
   it, and your tio session keeps running.
 - **Several agent sessions can share one device.** They all attach to your tio, so
-  nothing races for the port or for the session paths.
+  nothing races for the port or for the session paths. Everyone sees all device
+  output, whoever caused it.
 - **You see everything first.** Including the boot messages from before the agent
   was involved.
+
+> Sharing is for **coexistence, not for simultaneous typing.** tio forwards each
+> client's bytes to the port as they arrive and does not buffer per client, so if
+> two clients write at the same instant their commands interleave — `echo a` from
+> one and `echo b` from the other can reach the device as `echoecho a` and fail.
+> Have one agent (or you) drive the device at a time; the others can watch. There
+> is no locking in tio's socket protocol, so this cannot be enforced from here.
 
 > tio 3.9+ **requires the `unix:` prefix**: `-S /tmp/x.sock` fails with "Invalid
 > socket scheme". Use `-S unix:/tmp/x.sock`.
@@ -198,15 +206,28 @@ Or poke the session directly (same raw protocol):
 
 `disconnect` closes the device and drops all attached clients.
 
-> Only one process can hold the serial device. If you already have tio open on
-> `/dev/ttyUSB0`, either quit it first and let the agent own the device, or keep
-> it and have the agent **attach** to it (see above) instead of opening the port
-> itself.
+> **Only one process can hold the serial device, and the server enforces it.**
+> ttys are not exclusive-open — `pyserial` will happily open a port another
+> process already holds, after which the two interleave bytes on the wire — so
+> the server takes an advisory lock per device instead. If something else holds
+> it, `connect(port=...)` fails and names the holder's pid and command rather
+> than sharing the port. The kernel releases the lock when the holder exits, so a
+> crashed server never leaves the port blocked.
 >
-> In this direction, run **one** agent session per serial device: each MCP server
-> creates its session socket and pty at the same paths, so a second server
-> connecting to the same device would take those paths over from the first. That
-> restriction does not apply to attach mode, where your tio owns the paths.
+> **A live session is never taken over.** If a session socket is already being
+> served — by your own tio, or by another agent — `connect(port=...)` refuses
+> instead of unlinking it and binding its own, and tells you to join it with
+> `attach` (or to pass a different `session_socket` path). This matters because
+> taking the path over would leave the previous owner running, still holding the
+> device, but unreachable — silently breaking the session you were using.
+>
+> If an agent reports *"session socket ... is already served"* or *"... is
+> already held"*, it does not need a fix: it should `attach` to the existing
+> session, or you should quit the holder first.
+>
+> In this direction, run **one** agent session per serial device. Attach mode is
+> exempt: there your tio owns the port and the session paths, and any number of
+> agents can join it.
 
 ## Tools
 
@@ -229,6 +250,7 @@ Or poke the session directly (same raw protocol):
 - `attach(attach_socket=None, prompt_regex=None)`: convenience wrapper for
   joining a session. Without a path it auto-detects live session sockets and
   requires exactly one, so an ambiguous setup is reported rather than guessed at.
+  Pass the path explicitly when more than one session is live.
 - `disconnect()`: closes the port, stops the reader, and drops session clients.
   In attach mode it only detaches: the owner's session keeps running.
 - `send_command(text, line_ending="lf", timeout=5.0, idle_timeout=0.2,
