@@ -3,10 +3,14 @@
 Small FastMCP server that exposes a generic serial transport. It does not assume a
 specific device, shell, login flow, prompt, or command language.
 
-**The AI opens the device; you attach to its session.** The session socket and
-companion pty exist while a connection is open, so you can watch or type from
-your own terminal at the same time. The device is opened only when the AI calls
-`connect` — never automatically at startup.
+**Either side can own the device.** Serial ports cannot be shared, so one party
+holds the port and the other joins its session over a raw-byte UNIX socket:
+
+- **You own it** — run `tio -S unix:/tmp/serial-mcp-<dev>.sock <device>` and the
+  agent attaches to your session (`attach`). It cannot lock you out, and several
+  agent sessions can share the one device.
+- **The agent owns it** — it calls `connect(port=...)` and serves a session socket
+  plus a companion pty for your terminal tools to attach to.
 
 Repo: https://github.com/alvinla264/serial-mcp
 
@@ -139,50 +143,94 @@ args = ["--from", "git+https://github.com/alvinla264/serial-mcp", "serial-mcp"]
 Reload with the `MCP: List Servers` command (or restart VS Code), then start
 Copilot Chat in agent mode and ask it to connect to the serial device.
 
-Then reload/restart the agent so it picks up the server, and just say
-"connect to the serial device".
+Then reload/restart the agent so it picks up the server, and tell it what you
+want — "attach to my serial session" (see below) or "connect to the serial
+device".
 
-### Share the session from your terminal
+### Two ways to share one device
 
-1. Tell the AI to connect: it calls `connect(port="/dev/ttyUSB0")` and reports
-   the session socket, e.g. `/tmp/serial-mcp-ttyUSB0.sock` (derived from the
-   device name, so multiple devices get unique sockets).
-2. Attach from your terminal with any tty tool on the companion pty:
+A serial port can only be held by one process, so either the **agent** or **you**
+owns it — and the other attaches to that session. Both directions use the same
+raw-byte tio socket protocol.
 
-       tio /tmp/serial-mcp-ttyUSB0        # or screen, minicom, cat/echo, ...
+#### You own it, the agent attaches (recommended)
 
-   The server exposes a pty (symlinked next to the socket, same name without
-   `.sock`) precisely so terminal tools can attach: device output streams in,
-   your typing goes to the device. With tio you additionally get timestamps
-   and the ctrl-t command menu (ctrl-t q quits). You can re-attach anytime
-   without reconnecting.
+Start tio yourself. It holds the device and serves a socket; the agent joins as
+a client whenever you ask it to.
 
-   Or poke the session directly (same raw protocol tio serves):
+```bash
+tio -S unix:/tmp/serial-mcp-ttyUSB0.sock /dev/ttyUSB0
+```
 
-       echo "ls" | nc -UN /tmp/serial-mcp-ttyUSB0.sock
+Then tell the agent to attach — it calls `attach()` (auto-detects the socket) or
+`connect(attach_socket="/tmp/serial-mcp-ttyUSB0.sock")`.
 
-3. `disconnect` closes the device and drops all attached clients.
+Why this is usually better:
+
+- **The agent cannot lock you out.** It holds no port; `disconnect` only detaches
+  it, and your tio session keeps running.
+- **Several agent sessions can share one device.** They all attach to your tio, so
+  nothing races for the port or for the session paths.
+- **You see everything first.** Including the boot messages from before the agent
+  was involved.
+
+> tio 3.9+ **requires the `unix:` prefix**: `-S /tmp/x.sock` fails with "Invalid
+> socket scheme". Use `-S unix:/tmp/x.sock`.
+>
+> Run tio in a real terminal. With stdin redirected (a pipe or `/dev/null`) it
+> prints `Disconnected` and exits immediately, and nothing is relayed.
+
+#### The agent owns it, you attach
+
+The agent calls `connect(port="/dev/ttyUSB0")`, which opens the device and serves
+a session socket plus a **companion pty**. You then attach with any tty tool:
+
+    tio /tmp/serial-mcp-ttyUSB0        # or screen, minicom, cat/echo, ...
+
+The pty (symlinked next to the socket, same name without `.sock`) exists so real
+terminal tools can attach as if it were the device: device output streams in, your
+typing goes to the device. With tio you also get timestamps and the ctrl-t command
+menu (ctrl-t q quits). You can re-attach anytime without reconnecting the agent.
+
+Or poke the session directly (same raw protocol):
+
+    echo "ls" | nc -UN /tmp/serial-mcp-ttyUSB0.sock
+
+`disconnect` closes the device and drops all attached clients.
 
 > Only one process can hold the serial device. If you already have tio open on
-> `/dev/ttyUSB0`, quit it first; if the AI holds it, attach to its session as
-> above instead of opening the port yourself.
+> `/dev/ttyUSB0`, either quit it first and let the agent own the device, or keep
+> it and have the agent **attach** to it (see above) instead of opening the port
+> itself.
 >
-> Run **one** agent session per serial device. Serial ports cannot be shared, and
-> each MCP server creates its session socket and pty at the same paths, so a
-> second server connecting to the same device would take those paths over from
-> the first. Agents that do not need the device are unaffected — nothing is
-> opened until `connect` is called.
+> In this direction, run **one** agent session per serial device: each MCP server
+> creates its session socket and pty at the same paths, so a second server
+> connecting to the same device would take those paths over from the first. That
+> restriction does not apply to attach mode, where your tio owns the paths.
 
 ## Tools
 
-- `connect(port, baudrate=115200, timeout=0.1, prompt_regex=None,
-  session_socket="auto")`: opens the serial port, starts the background
-  reader, and serves the session socket. `session_socket` defaults to
-  "auto", which derives `/tmp/serial-mcp-<devname>.sock` from the port;
-  pass an explicit path or `""` to disable. `prompt_regex` is an optional
-  default terminator regex for command completion. Calling it again for the
-  same device reuses the existing session (and keeps anyone attached to it).
+- `connect(port=None, baudrate=115200, timeout=0.1, prompt_regex=None,
+  session_socket="auto", attach_socket=None)`: opens the serial port (owning it),
+  or joins a session someone else serves. Pass exactly one of `port` or
+  `attach_socket`:
+
+  - `port=...` — open and own the device, then serve the session socket.
+    `session_socket` defaults to "auto", deriving
+    `/tmp/serial-mcp-<devname>.sock`; pass an explicit path or `""` to disable.
+    Calling it again for the same device reuses the existing session (and keeps
+    anyone attached to it).
+  - `attach_socket=...` — join a session already being served (typically your
+    own `tio -S unix:/tmp/serial-mcp-<dev>.sock <device>`). No port is opened and
+    no session socket or pty is created; `disconnect` detaches without
+    disturbing the owner.
+
+  `prompt_regex` is an optional default terminator regex for command completion.
+- `attach(attach_socket=None, prompt_regex=None)`: convenience wrapper for
+  joining a session. Without a path it auto-detects live session sockets and
+  requires exactly one, so an ambiguous setup is reported rather than guessed at.
 - `disconnect()`: closes the port, stops the reader, and drops session clients.
+  In attach mode it only detaches: the owner's session keeps running.
 - `send_command(text, line_ending="lf", timeout=5.0, idle_timeout=0.2,
   terminator_regex=None, encoding="utf-8")`: sends `text` plus an explicit line
   ending (`none`, `lf`, `cr`, or `crlf`) and returns bytes observed after the
@@ -202,8 +250,9 @@ Then reload/restart the agent so it picks up the server, and just say
   in hex (like `tio --hex`).
 - `list_serial_ports()`: lists available serial ports with descriptions
   (like `tio --list`).
-- `tio_info()`: connection status, the session socket path, attached client
-  count, and attach instructions.
+- `tio_info()`: connection status. In direct mode: the session socket path,
+  attached client count, and attach instructions. In attach mode: which session is
+  joined, that this server holds no port, and that detaching leaves it running.
 
 ### Bootloader entry (U-Boot)
 
@@ -248,23 +297,35 @@ just call `enter_bootloader(profile="mydevice")`.
 
 ## Session protocol notes
 
-Two attach surfaces share one broadcast path:
+One owner, any number of clients. The owner holds the serial port; clients join
+over a UNIX socket that speaks tio's `--socket` protocol (see tio
+`src/socket.c`) — raw bytes, no handshake or framing, so `nc -UN`, expect
+scripts, and tio itself can all join.
 
-- **Companion pty** (`/tmp/serial-mcp-<dev>`, a symlink to a virtual tty):
-  what terminal tools attach to — it just looks like a normal serial device.
-- **UNIX socket** (`/tmp/serial-mcp-<dev>.sock`): speaks tio's `--socket`
-  protocol (see tio `src/socket.c`), which is raw bytes: all device output is
-  broadcast to every attached client, and every client's bytes are forwarded
-  to the device. No handshake or framing, so `nc -UN`, expect scripts, etc.
-  can join.
+**When this server owns the device** it serves that socket, and additionally
+exposes a companion pty so terminal tools can attach as if it were a real device:
 
-Both directions are bridged: input from either surface goes to the device,
-device output goes to both.
+- **Companion pty** (`/tmp/serial-mcp-<dev>`, a symlink to a virtual tty): what
+  `tio`, `screen`, `minicom`, `cat` attach to.
+- **UNIX socket** (`/tmp/serial-mcp-<dev>.sock`): the same raw protocol, for
+  `nc -UN`, scripts, and other agents.
 
-Nobody's typing is echoed by the server; each party sees input via the
-device's echo, exactly like tio's shared-session mode. Connection loss (the
-device is unplugged) is surfaced as an EIO error; the reader stops and
-`connect` must be called again.
+Device output is broadcast to every attached client, and every client's bytes are
+forwarded to the device, so both directions are bridged across both surfaces.
+
+**When this server attaches** to someone else's session (your tio), it is simply
+another client on that socket: it holds no port, serves nothing, and creates no
+pty. Detaching closes only its own connection.
+
+Nobody's typing is echoed by the server; each party sees input via the device's
+echo, exactly like tio's shared-session mode. Connection loss is surfaced as an
+EIO error — the device was unplugged (direct mode), or the owner's socket closed
+(attach mode). The reader stops and `connect` must be called again.
+
+A liveness probe explains one wrinkle of attach mode: to tell a live session from
+a leftover socket file, the server connects briefly and closes. The owner sees
+that as a client that joined and left immediately, which its accept loop must
+tolerate — tio does.
 
 ## Buffer semantics
 

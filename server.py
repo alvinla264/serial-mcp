@@ -34,6 +34,11 @@ LINE_ENDINGS = {
 
 SESSION_SOCKET_AUTO = "auto"  # derives /tmp/serial-mcp-<devname>.sock from the port
 
+# Where session sockets live. A module constant rather than a literal so the
+# lookup is testable without inheriting whatever happens to be live in /tmp.
+SESSION_SOCKET_DIR = "/tmp"
+SESSION_SOCKET_GLOB = "serial-mcp-*.sock"
+
 
 def _session_socket_for_port(port: str) -> str:
     """Derive a unique session socket path from the serial device name."""
@@ -86,12 +91,162 @@ def _load_json_file(path: Path) -> dict:
         return {}
 
 
+def _attach_socket_for_port(port: str) -> str:
+    """Default socket path to attach to, matching the documented tio pairing."""
+    return _session_socket_for_port(port)
+
+
+def _glob_session_sockets() -> list[str]:
+    """Session sockets this server (or a matching tio) may be serving."""
+    import glob as _glob
+
+    return _glob.glob(os.path.join(SESSION_SOCKET_DIR, SESSION_SOCKET_GLOB))
+
+
+def _socket_is_live(path: str) -> bool:
+    """True if something is listening on `path` right now.
+
+    A stale socket file with no listener accepts neither connect nor is it
+    useful, so this is what distinguishes "tio is serving this device" from
+    "leftover file from a dead process".
+
+    The probe connects and immediately closes. On a stream socket the owner sees
+    that as a client that attached and left straight away, which its accept loop
+    must tolerate; it is the only way to tell a live listener from a dead file.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        probe.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+
+
+class DirectTransport:
+    """Owns a serial device: the server is the only party holding the port.
+
+    Exposes the same minimal interface as SocketTransport so the reader loop and
+    every tool work identically over either transport.
+    """
+
+    kind = "direct"
+
+    def __init__(self, port: str, baudrate: int, timeout: float) -> None:
+        self.ser = serial.Serial(port, baudrate, timeout=timeout)
+        self.port = port
+        self.baudrate = baudrate
+
+    @property
+    def is_open(self) -> bool:
+        return bool(self.ser and self.ser.is_open)
+
+    @property
+    def in_waiting(self) -> int:
+        return self.ser.in_waiting
+
+    def read(self, size: int) -> bytes:
+        return self.ser.read(size)
+
+    def write(self, data: bytes) -> None:
+        self.ser.write(data)
+
+    def flush(self) -> None:
+        self.ser.flush()
+
+    def close(self) -> None:
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+class SocketTransport:
+    """Attaches to a socket that someone else is serving (typically tio).
+
+    The owner — the user's `tio -S unix:/tmp/...` — holds the device. This side
+    only relays raw bytes, using the same tio --socket protocol the session
+    server speaks: no handshake, no framing. Nothing here kills the owner: the
+    socket is simply closed on disconnect, which drops this attachment and
+    leaves the user's tio session running.
+    """
+
+    kind = "attach"
+
+    def __init__(self, path: str, timeout: float = 0.1) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(max(timeout, 0.05))
+        self.sock.connect(path)
+        self.port = path
+        self.baudrate = None
+        self._pending = b""
+
+    @property
+    def is_open(self) -> bool:
+        return self.sock is not None
+
+    @property
+    def in_waiting(self) -> int:
+        # A stream socket cannot report a count, so pull whatever is already
+        # buffered locally; the reader loops on this same call cheaply.
+        if self._pending:
+            return len(self._pending)
+        try:
+            data = self.sock.recv(65536)
+        except (socket.timeout, BlockingIOError):
+            return 0
+        except OSError:
+            raise
+        if not data:
+            # Owner closed the socket: surface as EIO so the reader stops with
+            # the same "connection unavailable" handling as an unplugged port.
+            raise OSError(errno.EIO, "socket closed by peer")
+        self._pending += data
+        return len(self._pending)
+
+    def read(self, size: int) -> bytes:
+        data, self._pending = self._pending[:size], self._pending[size:]
+        return data
+
+    def write(self, data: bytes) -> None:
+        self.sock.sendall(data)
+
+    def flush(self) -> None:
+        pass  # sendall already pushed the bytes
+
+    def close(self) -> None:
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 class SerialState:
     """Thread-safe serial connection, background RX buffer/log, and a tio-protocol
-    session socket the user can attach to."""
+    session socket the user can attach to.
+
+    Two transports are supported, selected by how connect() is called:
+
+    * direct  — this server opens the serial port and owns it, exposing a
+                session socket + companion pty for the user to attach to.
+    * attach  — someone else owns the device (typically the user's
+                `tio -S unix:/tmp/... `), and this server joins that session as
+                a client. No session socket or pty is created; the owner keeps
+                running when we disconnect.
+
+    Everything above the transport (buffering, send/read, login, bootloader) is
+    transport-agnostic.
+    """
 
     def __init__(self) -> None:
-        self.ser: serial.Serial | None = None
+        self.transport: DirectTransport | SocketTransport | None = None
         self.default_timeout = 5.0
         self.default_idle_timeout = 0.2
         self.prompt_pattern: re.Pattern[bytes] | None = None
@@ -176,10 +331,11 @@ class SerialState:
     def _reader_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                if self.ser and self.ser.is_open:
-                    waiting = self.ser.in_waiting
+                transport = self.transport
+                if transport is not None and transport.is_open:
+                    waiting = transport.in_waiting
                     if waiting > 0:
-                        chunk = self.ser.read(waiting)
+                        chunk = transport.read(waiting)
                         if chunk:
                             self._log_rx_chunk(chunk)
                             self._record_io("RX", "device", chunk)
@@ -198,12 +354,10 @@ class SerialState:
                 if self._is_eio_error(e):
                     self._log("WARN", f"Serial reader stopping after I/O error; connection unavailable: {e}")
                     self.stop_event.set()
-                    if self.ser:
-                        try:
-                            self.ser.close()
-                        except Exception:
-                            pass
-                        self.ser = None
+                    transport = self.transport
+                    if transport is not None:
+                        transport.close()
+                        self.transport = None
                     break
                 self._log("ERR", f"Reader loop error: {e}")
                 time.sleep(0.2)
@@ -221,20 +375,46 @@ class SerialState:
 
     def connect(
         self,
-        port: str,
+        port: str | None = None,
         baudrate: int = 115200,
         timeout: float = 0.1,
         prompt_regex: str | None = None,
         session_socket: str | None = SESSION_SOCKET_AUTO,
+        attach_socket: str | None = None,
     ) -> str:
-        """Open the serial device and serve a tio-protocol session socket.
+        """Open the serial device, or attach to a session someone else is serving.
 
-        If the session socket is already running at the requested path, it is
-        kept alive across the (re)connect so an attached user's tio/screen
-        session survives AI connects, reconnects, and baudrate changes.
+        Two modes, chosen by the arguments:
+
+        * **Direct** (`port=...`, `attach_socket=None`): open the device and own
+          it, serving a session socket and companion pty for the user to attach
+          to. A live session at the requested path is kept intact across
+          reconnects so an attached user is not dropped.
+
+        * **Attach** (`attach_socket=...`): join a session that is already
+          being served by someone else — typically the user's
+          `tio -S unix:/tmp/serial-mcp-<dev>.sock <device>`. This server becomes
+          a client: it never opens the port, never creates a session socket or
+          pty, and disconnecting leaves the owner's tio session running.
+
+        Passing both is rejected: exactly one side must own the device.
         """
         try:
+            if port and attach_socket:
+                return (
+                    "Error: pass either port= (own the device) or attach_socket= "
+                    "(join an existing session), not both."
+                )
+            if not port and not attach_socket:
+                return (
+                    "Error: pass port= to open a device, or attach_socket= to join an "
+                    "existing session (e.g. your tio -S unix:/tmp/serial-mcp-<dev>.sock)."
+                )
+
             prompt_pattern = self._compile_optional_regex(prompt_regex)
+
+            if attach_socket is not None:
+                return self._connect_attach(attach_socket, prompt_pattern, timeout)
 
             if session_socket == SESSION_SOCKET_AUTO:
                 session_socket = _session_socket_for_port(port)
@@ -245,10 +425,11 @@ class SerialState:
                 and self.session_path == session_socket
             )
             same_port = (
-                self.ser is not None
-                and self.ser.is_open
-                and getattr(self.ser, "port", None) == port
-                and int(getattr(self.ser, "baudrate", 0) or 0) == int(baudrate)
+                self.transport is not None
+                and self.transport.kind == "direct"
+                and self.transport.is_open
+                and self.transport.port == port
+                and int(self.transport.baudrate or 0) == int(baudrate)
             )
 
             if same_port:
@@ -271,14 +452,9 @@ class SerialState:
                     self._stop_session()
                 self._stop_reader()
                 self._flush_rx_log_buffer(force=True)
-                if self.ser is not None:
-                    try:
-                        self.ser.close()
-                    except Exception:
-                        pass
-                    self.ser = None
+                self._close_transport()
 
-                self.ser = serial.Serial(port, baudrate, timeout=timeout)
+                self.transport = DirectTransport(port, baudrate, timeout)
                 self.prompt_pattern = prompt_pattern
                 with self.buffer_lock:
                     self.buffer = b""
@@ -305,8 +481,146 @@ class SerialState:
             return result
         except Exception as e:
             self._log("ERR", f"Connect failed: {e}")
-            return f"Error connecting to {port}: {e}"
+            target = port or attach_socket
+            return f"Error connecting to {target}: {e}"
 
+    def attach(self, attach_socket: str | None = None, prompt_regex: str | None = None) -> str:
+        """Join a session served elsewhere, auto-detecting the socket if not given.
+
+        Detection looks for live session sockets matching the naming this server
+        uses for its own sessions (serial-mcp-*.sock in the session directory).
+        Exactly one must be live: zero means the user has not started a session,
+        several means the choice is ambiguous and guessing could join the wrong
+        device.
+        """
+        if not attach_socket:
+            candidates = [
+                p
+                for p in sorted(_glob_session_sockets())
+                if _socket_is_live(p)
+            ]
+            if not candidates:
+                return (
+                    "Error: no live session socket found under "
+                    f"{os.path.join(SESSION_SOCKET_DIR, SESSION_SOCKET_GLOB)}. "
+                    "Start one first, e.g.\n"
+                    "  tio -S unix:/tmp/serial-mcp-<dev>.sock /dev/ttyUSB0\n"
+                    "or pass attach_socket= explicitly."
+                )
+            if len(candidates) > 1:
+                listed = "\n".join(f"  {p}" for p in candidates)
+                return (
+                    f"Error: several live session sockets found; pass attach_socket= to "
+                    f"choose one:\n{listed}"
+                )
+            attach_socket = candidates[0]
+
+        return self.connect(attach_socket=attach_socket, prompt_regex=prompt_regex)
+
+    def _connect_attach(
+        self, path: str, prompt_pattern: re.Pattern[bytes] | None, timeout: float
+    ) -> str:
+        """Join a session served elsewhere (tio --socket protocol)."""
+        already = (
+            self.transport is not None
+            and self.transport.kind == "attach"
+            and self.transport.is_open
+            and self.transport.port == path
+        )
+        if already:
+            self.prompt_pattern = prompt_pattern
+            return f"Already attached to {path}."
+
+        # Owning the device and attaching to it at the same time would fight
+        # over the same bytes; drop our own session first.
+        self._stop_session()
+        self._stop_reader()
+        self._flush_rx_log_buffer(force=True)
+        self._close_transport()
+
+        if not os.path.exists(path):
+            return (
+                f"Error: no session socket at {path}. Start one first, e.g.\n"
+                f"  tio -S unix:{path} /dev/ttyUSB0"
+            )
+        if not _socket_is_live(path):
+            return (
+                f"Error: {path} exists but nothing is listening on it (stale file from "
+                f"a dead process?). Start a session, e.g.\n  tio -S unix:{path} /dev/ttyUSB0"
+            )
+
+        self.transport = SocketTransport(path, timeout=timeout)
+        self.prompt_pattern = prompt_pattern
+        with self.buffer_lock:
+            self.buffer = b""
+        self.log_rx_buffer = ""
+        self.log_rx_last_update = None
+        self.io_history.clear()
+
+        self.stop_event.clear()
+        self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader_thread.start()
+
+        self._log("SYS", f"Attached to session socket {path}")
+        return (
+            f"Attached to the session at {path}.\n"
+            "The device is owned by whoever serves that socket (your tio); "
+            "disconnect detaches this server without disturbing their session."
+        )
+
+    def _close_transport(self) -> None:
+        transport, self.transport = self.transport, None
+        if transport is not None:
+            transport.close()
+
+    def _is_connected(self) -> bool:
+        """True when a transport is present and usable, either mode."""
+        return self.transport is not None and self.transport.is_open
+
+    def _connection_label(self) -> str:
+        """Human-readable description of what this server is connected to."""
+        if self.transport is None:
+            return "nothing"
+        if self.transport.kind == "attach":
+            return f"session at {self.transport.port} (owned by its server, e.g. your tio)"
+        return f"{self.transport.port} at {self.transport.baudrate} baud"
+
+    @property
+    def ser(self):
+        """The underlying pyserial object in direct mode, else None.
+
+        Kept for callers (and tests) that inspect the raw serial handle; attach
+        mode has no local port, so this is None there.
+        """
+        transport = self.transport
+        if transport is not None and transport.kind == "direct":
+            return transport.ser
+        return None
+
+    @ser.setter
+    def ser(self, value) -> None:
+        """Allow tests (and any direct caller) to install a serial-like handle.
+
+        Wrapping it in a DirectTransport keeps one read path for the reader loop,
+        so a fake object is exercised exactly like a real port. Passing None
+        drops the transport.
+        """
+        if value is None:
+            transport = self.transport
+            if transport is not None and transport.kind == "direct":
+                transport.ser = None
+            return
+
+        transport = self.transport
+        if transport is not None and transport.kind == "direct":
+            transport.ser = value
+            return
+
+        wrapped = DirectTransport.__new__(DirectTransport)
+        wrapped.ser = value
+        wrapped.port = getattr(value, "port", "<serial>")
+        wrapped.baudrate = getattr(value, "baudrate", None)
+        self.transport = wrapped
     def _stop_reader(self) -> None:
         self.stop_event.set()
         if self.reader_thread:
@@ -314,17 +628,24 @@ class SerialState:
             self.reader_thread = None
 
     def disconnect(self) -> str:
+        was_attach = self.transport is not None and self.transport.kind == "attach"
+        owner = self.transport.port if self.transport is not None else None
         self._stop_session()
         self._stop_reader()
 
         self._flush_rx_log_buffer(force=True)
 
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            self.ser = None
+        if self.transport is not None and self.transport.is_open:
+            self._close_transport()
+            if was_attach:
+                self._log("SYS", f"Detached from session socket {owner}")
+                return (
+                    f"Detached from {owner}. The session is still running (the owner's "
+                    "tio was not disturbed)."
+                )
             self._log("SYS", "Disconnected")
             return "Disconnected."
-        self.ser = None
+        self._close_transport()
         return "No active connection."
 
     def _compile_optional_regex(self, pattern: str | None) -> re.Pattern[bytes] | None:
@@ -336,8 +657,8 @@ class SerialState:
         with self.write_lock:
             self._log("TX", data)
             self._record_io("TX", "ai", data)
-            self.ser.write(data)
-            self.ser.flush()
+            self.transport.write(data)
+            self.transport.flush()
 
     def _snapshot_len(self) -> int:
         with self.buffer_lock:
@@ -385,7 +706,7 @@ class SerialState:
         terminator_regex: str | None = None,
         encoding: str = "utf-8",
     ) -> str:
-        if not self.ser or not self.ser.is_open:
+        if not self._is_connected():
             return "Error: Not connected to a serial port."
         if line_ending not in LINE_ENDINGS:
             return f"Error: line_ending must be one of {', '.join(LINE_ENDINGS)}."
@@ -397,8 +718,8 @@ class SerialState:
         with self.write_lock:
             self._log("TX", payload)
             self._record_io("TX", "ai", payload)
-            self.ser.write(payload)
-            self.ser.flush()
+            self.transport.write(payload)
+            self.transport.flush()
 
         data = self._wait_for_output(start, timeout, idle_timeout, terminator)
         return data.decode(encoding, errors="replace")
@@ -575,13 +896,13 @@ class SerialState:
 
     def _session_user_write(self, payload: bytes) -> None:
         with self.write_lock:
-            if not self.ser or not self.ser.is_open:
+            if not self._is_connected():
                 return
             try:
                 self._log("TX:USER", payload)
                 self._record_io("TX", "user", payload)
-                self.ser.write(payload)
-                self.ser.flush()
+                self.transport.write(payload)
+                self.transport.flush()
             except Exception:
                 return
 
@@ -626,8 +947,8 @@ class SerialState:
         with self.write_lock:
             self._log("TX", "[redacted]")
             self._record_io("TX", "ai", b"[redacted]")
-            self.ser.write(data)
-            self.ser.flush()
+            self.transport.write(data)
+            self.transport.flush()
 
     def _blind_login(self, username: str, password: str, encoding: str, settle: float = 0.6) -> None:
         """Log in without verifying prompts.
@@ -763,7 +1084,7 @@ class SerialState:
         The password is only ever submitted through _redacted_write, so it never
         appears in the log file or the view_io transcript.
         """
-        if not self.ser or not self.ser.is_open:
+        if not self._is_connected():
             return "Error: Not connected to a serial port."
 
         prof = self._merged_boot_profiles().get(profile or "", {})
@@ -878,7 +1199,7 @@ class SerialState:
                 f"Error: unknown boot profile '{profile}'. See list_boot_profiles; "
                 f"user profiles live in {USER_PROFILES_PATH}."
             )
-        if not self.ser or not self.ser.is_open:
+        if not self._is_connected():
             return "Error: Not connected to a serial port."
 
         iprof = prof.get("interrupt", {})
@@ -1086,20 +1407,29 @@ class SerialState:
         )
 
     def tio_info(self) -> str:
-        if self.ser is None or not self.ser.is_open:
+        if not self._is_connected():
             return (
-                "Not connected. Call connect(port=...) to open the device; a session "
-                "socket starts automatically, then you can attach from your terminal."
+                "Not connected. Call connect(port=...) to open the device, or "
+                "connect(attach_socket=...) to join a session you are already "
+                "serving with tio."
+            )
+        if self.transport.kind == "attach":
+            return (
+                f"Attached to the session at {self.transport.port}.\n"
+                "The device is owned by whoever serves that socket (your tio), so "
+                "this server holds no port and exposes no session of its own.\n"
+                f"Disconnect detaches without disturbing {self.transport.port}.\n"
             )
         if not self.session_running.is_set() or not self.session_path:
             return (
-                f"Connected to {self.ser.port}, but the session socket is not running "
-                "(reconnect to restart it)."
+                f"Connected to {self.transport.port}, but the session socket is not "
+                "running (reconnect to restart it)."
             )
         with self.session_lock:
             count = len(self.session_clients)
         return (
-            f"Device {self.ser.port} is held by this MCP session; {count} client(s) attached.\n"
+            f"Device {self.transport.port} is held by this MCP session; "
+            f"{count} client(s) attached.\n"
             + _attach_hint(self.session_path)
         )
 
@@ -1109,29 +1439,54 @@ state = SerialState()
 
 @mcp.tool()
 def connect(
-    port: str,
+    port: str | None = None,
     baudrate: int = 115200,
     timeout: float = 0.1,
     prompt_regex: str | None = None,
     session_socket: str | None = SESSION_SOCKET_AUTO,
+    attach_socket: str | None = None,
 ) -> str:
-    """Open a serial port, start background reading, and serve a session socket.
+    """Open a serial port (owning it), or join a session someone else serves.
 
-    The AI holds the device; the user attaches to the session from their own
-    terminal (any tty tool on the companion pty, or nc -UN) using tio's raw-byte socket
-    protocol. Calling this while a session is already running keeps that session
-    (and anyone attached to it) alive; only the device link is (re)opened.
+    Two modes:
+
+    * `port=...` — open the device and own it. The user then attaches to this
+      server's session socket or companion pty. Calling it again for the same
+      device keeps the running session (and anyone attached) alive.
+    * `attach_socket=...` — join a session already being served, typically the
+      user's own `tio -S unix:/tmp/serial-mcp-<dev>.sock <device>`. This server
+      becomes a client and never opens the port, so the user's tio keeps owning
+      the device and keeps running when this server detaches.
+
+    Prefer attach mode when the user is already in tio: it cannot lock them out,
+    and several agent sessions can join one session without fighting over the
+    device. Pass exactly one of `port` or `attach_socket`.
 
     Args:
-        port: Serial device path, for example /dev/ttyUSB0.
-        baudrate: Serial baud rate.
-        timeout: Low-level pyserial read timeout used by the reader thread.
+        port: Serial device path to open and own, e.g. /dev/ttyUSB0.
+        baudrate: Serial baud rate (direct mode).
+        timeout: Low-level read timeout used by the reader thread.
         prompt_regex: Optional default regex terminator for send_command completion.
-        session_socket: UNIX socket path for the shared session. Defaults to
-            "auto", which derives a unique name from the device, e.g.
-            /tmp/serial-mcp-ttyUSB0.sock (pass "" to disable).
+        session_socket: UNIX socket this server serves in direct mode. "auto"
+            derives /tmp/serial-mcp-<dev>.sock; "" disables it.
+        attach_socket: Session socket to join instead of opening a device.
     """
-    return state.connect(port, baudrate, timeout, prompt_regex, session_socket)
+    return state.connect(port, baudrate, timeout, prompt_regex, session_socket, attach_socket)
+
+
+@mcp.tool()
+def attach(attach_socket: str | None = None, prompt_regex: str | None = None) -> str:
+    """Join a session the user is already serving (e.g. their tio session).
+
+    Convenience wrapper for connect(attach_socket=...) that defaults the socket
+    path to /tmp/serial-mcp-<dev>.sock for a known device, or auto-detects the
+    live session socket when exactly one exists.
+
+    Args:
+        attach_socket: Session socket to join. Defaults to auto-detection.
+        prompt_regex: Optional default regex terminator for send_command.
+    """
+    return state.attach(attach_socket, prompt_regex)
 
 
 @mcp.tool()

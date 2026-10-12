@@ -3,6 +3,7 @@ import os
 import pty
 import select
 import socket
+import tempfile
 
 import pytest
 import threading
@@ -244,6 +245,7 @@ def test_no_direct_attach_tools_exposed():
         "set_boot_credentials",
         "enter_bootloader",
         "login",
+        "attach",
     }
     forbidden = {"connect_via_tio", "logout", "enter_cli_mode", "check_mode"}
     if hasattr(server.mcp, "get_tools"):
@@ -814,3 +816,281 @@ def test_login_error_paths(boot_creds):
         assert state.login().startswith("Error: no credentials")
     finally:
         _cleanup(master, slave, stop, thread)
+
+
+# ---- attach mode: joining a session someone else serves ---------------------
+#
+# Models the user-first flow: the user runs something that owns the device and
+# serves a tio-protocol socket; the MCP server joins as a client. The stand-in
+# owner here is a plain fake server, not tio itself, so the tests never touch a
+# real device or a real tio install.
+
+
+class FakeSessionOwner:
+    """Minimal stand-in for `tio -S unix:<path> <device>`.
+
+    Owns a fake device (a pty) and serves the socket with the same raw-byte
+    protocol: everything the device writes is broadcast to attached clients, and
+    every client's bytes go to the device.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.device_master, self.device_slave = pty.openpty()
+        self.device_port = os.ttyname(self.device_slave)
+        self.clients = []
+        self.device_input = bytearray()
+        self.alive = True
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+        if os.path.exists(path):
+            os.unlink(path)
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(path)
+        self.srv.listen(8)
+        self.srv.settimeout(0.2)
+
+        self._threads = [
+            threading.Thread(target=self._accept_loop, daemon=True),
+            threading.Thread(target=self._device_loop, daemon=True),
+        ]
+        for t in self._threads:
+            t.start()
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            conn.settimeout(0.2)
+            with self._lock:
+                self.clients.append(conn)
+            threading.Thread(target=self._client_loop, args=(conn,), daemon=True).start()
+    def _client_loop(self, conn):
+        while not self._stop.is_set():
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            with self._lock:
+                self.device_input += data
+            try:
+                os.write(self.device_master, data)  # client -> device
+            except OSError:
+                break
+
+    def _device_loop(self):
+        while not self._stop.is_set():
+            r, _, _ = select.select([self.device_master], [], [], 0.1)
+            if self.device_master in r:
+                data = os.read(self.device_master, 4096)
+                if data:
+                    with self._lock:
+                        for c in list(self.clients):
+                            try:
+                                c.sendall(data)  # device -> all clients
+                            except OSError:
+                                pass
+
+    def device_reply(self, text):
+        os.write(self.device_master, text)
+
+    def device_seen(self, timeout=2.0):
+        """Bytes the device received from clients (recorded, not consumed)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self.device_input:
+                    return bytes(self.device_input)
+            time.sleep(0.02)
+        with self._lock:
+            return bytes(self.device_input)
+
+    def close(self):
+        self._stop.set()
+        self.alive = False
+        try:
+            self.srv.close()
+        except OSError:
+            pass
+        with self._lock:
+            for c in self.clients:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+            self.clients = []
+        for t in self._threads:
+            t.join(timeout=1)
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+        for fd in (self.device_master, self.device_slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_attach_joins_existing_session_and_exchanges_bytes():
+    owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
+    try:
+        result = state.attach(attach_socket=owner.path)
+        assert result.startswith("Attached"), result
+
+        # AI -> device, through the owner.
+        out = state.send_command("ping", timeout=1.0, idle_timeout=0.05)
+        assert owner.device_seen(1.0) == b"ping\n"
+
+        # device -> AI, through the owner.
+        owner.device_reply(b"pong")
+        seen = state.read_output(timeout=1.0, idle_timeout=0.05)
+        assert "pong" in seen
+    finally:
+        state.disconnect()
+        owner.close()
+
+
+def test_attach_creates_no_session_socket_or_pty_of_its_own():
+    """In attach mode this server must not claim the device or its paths."""
+    owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
+    try:
+        state.attach(attach_socket=owner.path)
+        assert state.transport.kind == "attach"
+        assert state.ser is None                      # holds no port
+        assert not state.session_running.is_set()     # serves no session
+        assert state.session_path is None
+        assert state.session_pty_master is None       # exposes no pty
+    finally:
+        state.disconnect()
+        owner.close()
+
+
+def test_attach_disconnect_leaves_the_owner_running():
+    owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
+    try:
+        state.attach(attach_socket=owner.path)
+        result = state.disconnect()
+        assert result.startswith("Detached"), result
+        # The owner is untouched and still reachable by someone else.
+        assert owner.alive
+        assert os.path.exists(owner.path)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.connect(owner.path)
+        probe.close()
+    finally:
+        state.disconnect()
+        owner.close()
+
+
+def test_attach_reports_errors_clearly():
+    state.disconnect()
+    missing = "/tmp/serial-mcp-NOSUCH.sock"
+    if os.path.exists(missing):
+        os.unlink(missing)
+    result = state.attach(attach_socket=missing)
+    assert result.startswith("Error: no session socket"), result
+    assert "tio -S unix:" in result  # tells the user how to start one
+
+
+def test_attach_rejects_stale_socket_file():
+    """"A leftover file with no listener must not look like a session."""
+    stale = "/tmp/serial-mcp-STALE.sock"
+    if os.path.exists(stale):
+        os.unlink(stale)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(stale)
+    s.close()  # bound then closed: file remains, nothing listens
+    try:
+        result = state.attach(attach_socket=stale)
+        assert result.startswith("Error:"), result
+        assert "nothing is listening" in result
+    finally:
+        if os.path.exists(stale):
+            os.unlink(stale)
+
+
+def test_connect_rejects_both_port_and_attach_socket():
+    result = state.connect(port="/dev/ttyUSB0", attach_socket="/tmp/x.sock")
+    assert result.startswith("Error:"), result
+    assert "not both" in result
+
+
+def test_connect_requires_a_target():
+    state.disconnect()
+    result = state.connect()
+    assert result.startswith("Error:"), result
+    assert "attach_socket" in result
+
+
+def test_attach_auto_detection_finds_the_live_session(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="smc") as d:
+        monkeypatch.setattr(server, "SESSION_SOCKET_DIR", d)
+        owner = FakeSessionOwner(os.path.join(d, "serial-mcp-A.sock"))
+        try:
+            result = state.attach()  # no path: auto-detect
+            assert result.startswith("Attached"), result
+            assert owner.path in result
+        finally:
+            state.disconnect()
+            owner.close()
+
+
+def test_attach_auto_detection_refuses_when_ambiguous(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="smc") as d:
+        monkeypatch.setattr(server, "SESSION_SOCKET_DIR", d)
+        a = FakeSessionOwner(os.path.join(d, "serial-mcp-A.sock"))
+        b = FakeSessionOwner(os.path.join(d, "serial-mcp-B.sock"))
+        try:
+            result = state.attach()
+            assert result.startswith("Error:"), result
+            assert "several live session sockets" in result
+            assert "serial-mcp-A.sock" in result and "serial-mcp-B.sock" in result
+        finally:
+            state.disconnect()
+            a.close()
+            b.close()
+
+
+def test_attach_auto_detection_reports_no_session(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="smc") as d:
+        monkeypatch.setattr(server, "SESSION_SOCKET_DIR", d)
+        state.disconnect()
+        result = state.attach()
+        assert result.startswith("Error: no live session socket"), result
+        assert "tio -S unix:" in result
+
+
+def test_tio_info_describes_attach_mode():
+    owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
+    try:
+        state.attach(attach_socket=owner.path)
+        info = state.tio_info()
+        assert owner.path in info
+        assert "owned by" in info
+        assert "Disconnect detaches" in info
+    finally:
+        state.disconnect()
+        owner.close()
+
+
+def test_reader_stops_when_the_owner_closes_the_socket():
+    """Losing the owner must surface as an unavailable connection, not a hang."""
+    owner = FakeSessionOwner("/tmp/serial-mcp-TESTATTACH.sock")
+    try:
+        state.attach(attach_socket=owner.path)
+        owner.close()  # owner goes away (closes every connection it accepted)
+        deadline = time.monotonic() + 3.0
+        while state.transport is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert state.transport is None
+        assert state.stop_event.is_set()
+    finally:
+        state.disconnect()
