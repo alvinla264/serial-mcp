@@ -254,14 +254,16 @@ Or poke the session directly (same raw protocol):
 - `disconnect()`: closes the port, stops the reader, and drops session clients.
   In attach mode it only detaches: the owner's session keeps running.
 - `send_command(text, line_ending="lf", timeout=5.0, idle_timeout=0.2,
-  terminator_regex=None, encoding="utf-8")`: sends `text` plus an explicit line
-  ending (`none`, `lf`, `cr`, or `crlf`) and returns bytes observed after the
-  send point. Completion uses `terminator_regex` (or the connection default) if
-  provided; otherwise it returns after `idle_timeout` seconds of silence, bounded
-  by the overall `timeout`.
-- `read_output(timeout=0.0, idle_timeout=0.2, encoding="utf-8")`: consumes and
-  returns buffered unsolicited/asynchronous output. With a positive timeout it
-  waits for arriving data and then for idle silence, never beyond timeout.
+  terminator_regex=None, encoding="utf-8", max_lines=0)`: sends `text` plus an
+  explicit line ending (`none`, `lf`, `cr`, or `crlf`) and returns bytes observed
+  after the send point. Completion uses `terminator_regex` (or the connection
+  default) if provided; otherwise it returns after `idle_timeout` seconds of
+  silence, bounded by the overall `timeout`. `max_lines` caps how much comes back
+  (see below).
+- `read_output(timeout=0.0, idle_timeout=0.2, encoding="utf-8", max_lines=0)`:
+  consumes and returns buffered unsolicited/asynchronous output. With a positive
+  timeout it waits for arriving data and then for idle silence, never beyond
+  timeout. `max_lines` caps how much comes back (see below).
 - `clear_output()`: discards currently buffered output.
 - `set_prompt_pattern(regex_pattern=None)`: sets or clears the default regex
   terminator used by `send_command`.
@@ -275,6 +277,24 @@ Or poke the session directly (same raw protocol):
 - `tio_info()`: connection status. In direct mode: the session socket path,
   attached client count, and attach instructions. In attach mode: which session is
   joined, that this server holds no port, and that detaching leaves it running.
+
+### Limiting returned output (`max_lines`)
+
+Console output is mostly noise — boot banners, repeated log spew — and the part
+worth reading is at the *end*: the prompt, the command result, the error. Both
+`send_command` and `read_output` accept `max_lines` so the AI can ask for just the
+tail instead of dragging thousands of irrelevant lines into context:
+
+- `max_lines=0` (the default) returns everything, unchanged.
+- `max_lines=N` keeps the **last** N lines and prepends a marker such as
+  `[... 12 earlier lines omitted ...]`, so a truncated result is never mistaken
+  for the whole reply.
+- Lines are counted on the decoded text; a partial final line without a trailing
+  newline still counts as one line and is never dropped.
+
+Use it when you expect verbose output and only care about the outcome, e.g.
+`send_command("dmesg", max_lines=30)` or draining an accumulated boot log with
+`read_output(max_lines=20)`. For byte-exact or hex views, use `view_io` instead.
 
 ### Bootloader entry (U-Boot)
 

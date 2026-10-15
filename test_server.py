@@ -208,6 +208,101 @@ def test_terminator_regex_completion_does_not_wait_full_timeout():
         _cleanup(master, slave, stop, thread)
 
 
+def test_cap_lines_keeps_the_tail_and_marks_the_elision():
+    cap = state._cap_lines
+    # 0 means unlimited: callers that do not ask for a cap keep old behaviour.
+    assert cap("a\nb\nc\n", 0) == "a\nb\nc\n"
+    assert cap("a\nb\n", -1) == "a\nb\n"
+    # Under the limit nothing is touched.
+    assert cap("a\nb\n", 5) == "a\nb\n"
+    # The *last* lines survive: that is where the prompt/result lives.
+    assert cap("a\nb\nc\n", 2) == "[... 1 earlier line omitted ...]\nb\nc\n"
+    assert cap("a\nb\nc\nd\n", 2) == "[... 2 earlier lines omitted ...]\nc\nd\n"
+    # A final line without a newline must not be lost or double-counted.
+    assert cap("a\nb\nc", 2) == "[... 1 earlier line omitted ...]\nb\nc"
+    assert cap("a\nb", 2) == "a\nb"
+    assert cap("", 3) == ""
+
+
+def test_send_command_max_lines_caps_console_noise():
+    def handler(master, stop):
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                os.read(master, 1024)
+                # A realistic burst: noise first, the useful line last.
+                os.write(master, b"noise-1\nnoise-2\nnoise-3\nRESULT=42\n")
+                return
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        out = state.send_command("go", timeout=1.0, idle_timeout=0.05, max_lines=2)
+        assert "RESULT=42" in out
+        assert "earlier lines omitted" in out
+        assert "noise-1" not in out
+        assert "noise-2" not in out
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_send_command_without_max_lines_still_returns_everything():
+    def handler(master, stop):
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master in readable:
+                os.read(master, 1024)
+                os.write(master, b"noise-1\nnoise-2\nnoise-3\nRESULT=42\n")
+                return
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        out = state.send_command("go", timeout=1.0, idle_timeout=0.05)
+        assert out == "noise-1\nnoise-2\nnoise-3\nRESULT=42\n"
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_read_output_max_lines_caps_the_drained_buffer():
+    def handler(master, stop):
+        while not stop.is_set():
+            time.sleep(0.05)
+
+    master, slave, port, stop, thread = _pty_device(handler)
+    try:
+        _connect(port)
+        # Unique marker: the RX log is a shared module-level file that other tests
+        # also scan, so reusing a common prompt string would collide with them.
+        os.write(master, b"boot line\nmore noise\nLINECAP-MARKER> ")
+        time.sleep(0.05)
+        out = state.read_output(timeout=1.0, idle_timeout=0.05, max_lines=1)
+        # The trailing prompt survives; the preceding noise is summarised away.
+        assert "LINECAP-MARKER> " in out
+        assert "boot line" not in out
+        assert "earlier lines omitted" in out
+    finally:
+        _cleanup(master, slave, stop, thread)
+
+
+def test_max_lines_is_exposed_on_both_mcp_tools():
+    """The cap must be visible to the AI on send_command and read_output."""
+    if hasattr(server.mcp, "get_tools"):
+        tools = asyncio.run(server.mcp.get_tools())
+    else:
+        tools = asyncio.run(server.mcp.list_tools())
+    by_name = {t.name: t for t in tools} if not isinstance(tools, dict) else tools
+
+    for name in ("send_command", "read_output"):
+        tool = by_name[name]
+        schema = getattr(tool, "parameters", None) or getattr(tool, "inputSchema", {})
+        props = schema.get("properties", {})
+        assert "max_lines" in props, f"{name} does not expose max_lines"
+        assert props["max_lines"].get("default") == 0, (
+            f"{name}.max_lines must default to 0 (unlimited)"
+        )
+
+
 def test_async_read_output_and_clear_output():
     def handler(master, stop):
         while not stop.is_set():

@@ -775,6 +775,32 @@ class SerialState:
             self.transport.write(data)
             self.transport.flush()
 
+    @staticmethod
+    def _cap_lines(text: str, max_lines: int) -> str:
+        """Keep only the last `max_lines` lines, marking what was dropped.
+
+        Console output is mostly noise (boot banners, repeated log spew), and the
+        part worth reading is at the *end* — the prompt, the command result, the
+        error. So the tail is what survives a cap, not the head.
+
+        `max_lines <= 0` means unlimited, which is the default so callers that do
+        not ask for a cap see exactly what they saw before.
+
+        The elision marker is prepended rather than appended so a truncated
+        result is never mistaken for a complete one; silently dropping text would
+        read as "that was all the device said".
+        """
+        limit = int(max_lines)
+        if limit <= 0:
+            return text
+        lines = text.splitlines(keepends=True)
+        if len(lines) <= limit:
+            return text
+        dropped = len(lines) - limit
+        kept = "".join(lines[-limit:])
+        noun = "line" if dropped == 1 else "lines"
+        return f"[... {dropped} earlier {noun} omitted ...]\n{kept}"
+
     def _snapshot_len(self) -> int:
         with self.buffer_lock:
             return len(self.buffer)
@@ -820,6 +846,7 @@ class SerialState:
         idle_timeout: float = 0.2,
         terminator_regex: str | None = None,
         encoding: str = "utf-8",
+        max_lines: int = 0,
     ) -> str:
         if not self._is_connected():
             return "Error: Not connected to a serial port."
@@ -837,12 +864,18 @@ class SerialState:
             self.transport.flush()
 
         data = self._wait_for_output(start, timeout, idle_timeout, terminator)
-        return data.decode(encoding, errors="replace")
+        return self._cap_lines(data.decode(encoding, errors="replace"), max_lines)
 
-    def read_output(self, timeout: float = 0.0, idle_timeout: float = 0.2, encoding: str = "utf-8") -> str:
+    def read_output(
+        self,
+        timeout: float = 0.0,
+        idle_timeout: float = 0.2,
+        encoding: str = "utf-8",
+        max_lines: int = 0,
+    ) -> str:
         start = 0
         data = self._wait_for_output(start, timeout, idle_timeout, None)
-        return data.decode(encoding, errors="replace")
+        return self._cap_lines(data.decode(encoding, errors="replace"), max_lines)
 
     def clear_output(self) -> str:
         with self.buffer_lock:
@@ -1634,6 +1667,7 @@ def send_command(
     idle_timeout: float = 0.2,
     terminator_regex: str | None = None,
     encoding: str = "utf-8",
+    max_lines: int = 0,
 ) -> str:
     """Send text bytes to the serial port and return output observed after the send.
 
@@ -1641,18 +1675,47 @@ def send_command(
     otherwise it returns after output has been quiet for idle_timeout, bounded by timeout.
     line_ending is explicit: none, lf, cr, or crlf. Data already buffered before this call is
     preserved for read_output; this call consumes only bytes received after its send point.
+
+    Args:
+        text: Bytes to send.
+        line_ending: One of none, lf, cr, crlf.
+        timeout: Overall cap in seconds for waiting on output.
+        idle_timeout: Seconds of silence that ends the wait.
+        terminator_regex: Regex that marks completion (overrides prompt_regex).
+        encoding: Text encoding for the serial stream.
+        max_lines: Return at most this many lines, keeping the *last* ones where
+            the prompt/result/error lives and noting how many earlier lines were
+            dropped. Use it to avoid pulling large boot banners or repetitive log
+            spew into context. 0 (the default) returns everything. Ignored for
+            hex/raw needs — raise it or use view_io(direction="rx") instead.
     """
-    return state.send_command(text, line_ending, timeout, idle_timeout, terminator_regex, encoding)
+    return state.send_command(
+        text, line_ending, timeout, idle_timeout, terminator_regex, encoding, max_lines
+    )
 
 
 @mcp.tool()
-def read_output(timeout: float = 0.0, idle_timeout: float = 0.2, encoding: str = "utf-8") -> str:
+def read_output(
+    timeout: float = 0.0,
+    idle_timeout: float = 0.2,
+    encoding: str = "utf-8",
+    max_lines: int = 0,
+) -> str:
     """Consume and return buffered/asynchronously arriving serial output.
 
     If timeout is 0, returns currently buffered data immediately. If timeout is positive,
     waits for data and then for idle_timeout of silence, never exceeding timeout.
+
+    Args:
+        timeout: Overall cap in seconds.
+        idle_timeout: Seconds of silence that ends the wait.
+        encoding: Text encoding for the serial stream.
+        max_lines: Return at most this many lines, keeping the *last* ones and
+            noting how many earlier lines were dropped. Useful when the buffer has
+            accumulated boot or log noise you do not need in context. 0 (the
+            default) returns everything.
     """
-    return state.read_output(timeout, idle_timeout, encoding)
+    return state.read_output(timeout, idle_timeout, encoding, max_lines)
 
 
 @mcp.tool()
