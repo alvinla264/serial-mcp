@@ -1,8 +1,15 @@
 import json
 import os
+import errno
+import base64
+import re
 import pty
+import shlex
 import select
+import tty
 import socket
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -12,7 +19,11 @@ import asyncio
 from pathlib import Path
 
 import server
+from fastmcp import Client
 from server import state
+from transfer_test_support import (
+    InteractiveShellTioOwner, RealShellDevice, UBootPeer, build_target_bin,
+)
 
 
 def _pty_device(handler):
@@ -341,6 +352,9 @@ def test_no_direct_attach_tools_exposed():
         "enter_bootloader",
         "login",
         "attach",
+        "upload_file",
+        "download_file",
+        "file_transfer_capabilities",
     }
     forbidden = {"connect_via_tio", "logout", "enter_cli_mode", "check_mode"}
     if hasattr(server.mcp, "get_tools"):
@@ -378,7 +392,11 @@ def test_view_io_records_ai_and_user_tx_and_rx():
         client.connect(_session_path(port))
         time.sleep(0.1)
         client.sendall(b"hello\n")
-        time.sleep(0.1)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if any(d == "TX" and source == "user" and b"hello" in data for _, d, source, data in state.io_history):
+                break
+            time.sleep(0.01)
 
         text = state.view_io(lines=10)
         assert "[TX:ai] ping" in text
@@ -1277,7 +1295,7 @@ def test_port_lock_blocks_a_second_owner(monkeypatch):
 
     master, slave = pty.openpty()
     port = os.ttyname(slave)
-    lock_path = f"/tmp/serial-mcp-{os.path.basename(port)}.lock"
+    lock_path = server._serial_port_lock_path(server._serial_device_id(port))
     try:
         # A different process holding the advisory lock stands in for a second
         # server. flock is per-open-file-description, so an independent fd here
@@ -1287,7 +1305,7 @@ def test_port_lock_blocks_a_second_owner(monkeypatch):
 
         result = state.connect(port=port)
         assert result.startswith("Error"), result
-        assert "already held" in result
+        assert "already held" in result or "supplementary serial-mcp lock" in result
         assert state.transport is None
 
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -1316,3 +1334,775 @@ def test_port_lock_is_released_on_disconnect():
         state.disconnect()
         os.close(master)
         os.close(slave)
+
+
+def _subprocess_holds_tty(port):
+    script = (
+        "import os,sys,time; fd=os.open(sys.argv[1], os.O_RDWR|os.O_NOCTTY|os.O_NONBLOCK); "
+        "print('READY', flush=True); time.sleep(30)"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script, str(port)], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "READY"
+    return proc
+
+
+def test_tio_first_direct_connect_refuses_alias_without_touching_owner(tmp_path):
+    master, slave = pty.openpty()
+    port = os.ttyname(slave)
+    alias = tmp_path / "serial-alias"
+    alias.symlink_to(port)
+    owner = _subprocess_holds_tty(port)
+    session_path = tmp_path / "must-not-be-created.sock"
+    try:
+        result = state.connect(port=str(alias), session_socket=str(session_path))
+        assert result.startswith("Error"), result
+        assert "already open" in result and "attach" in result.lower(), result
+        assert owner.poll() is None, "existing owner was killed"
+        assert state.transport is None
+        assert not state.session_running.is_set()
+        assert not session_path.exists()
+        assert state._port_lock_fd is None, "supplementary lock leaked after refusal"
+
+        owner.terminate()
+        owner.wait(timeout=3)
+        result = state.connect(port=str(alias), session_socket="")
+        assert result.startswith("Connected"), result
+        assert state.transport.device_id == server._serial_device_id(port)
+    finally:
+        state.disconnect()
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=3)
+        os.close(master)
+        os.close(slave)
+
+
+def test_direct_owner_blocks_second_open_through_alias_and_releases_exclusivity(tmp_path):
+    master, slave = pty.openpty()
+    port = os.ttyname(slave)
+    alias = tmp_path / "serial-alias"
+    alias.symlink_to(port)
+    try:
+        result = state.connect(port=port, session_socket="")
+        assert result.startswith("Connected"), result
+        script = (
+            "import os,sys\n"
+            "try:\n"
+            " fd=os.open(sys.argv[1], os.O_RDWR|os.O_NOCTTY|os.O_NONBLOCK)\n"
+            " print('OPENED', flush=True); os.close(fd)\n"
+            "except OSError as e:\n print('ERR', e.errno, flush=True)\n"
+        )
+        attempt = subprocess.run([sys.executable, "-c", script, str(alias)], capture_output=True, text=True, timeout=3)
+        assert attempt.stdout.strip() == f"ERR {errno.EBUSY}", attempt.stdout + attempt.stderr
+        assert state.transport is not None and state.transport.is_open
+        state.disconnect()
+        # TIOCNXCL cleanup must let a later owner open the same device again.
+        fd = os.open(alias, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        os.close(fd)
+    finally:
+        state.disconnect()
+        os.close(master)
+        os.close(slave)
+
+
+class _TransferMemorySerial:
+    """Byte-preserving fake direct serial transport for transfer unit tests."""
+    is_open = True
+    port = "<synthetic-transfer-peer>"
+    baudrate = 115200
+
+    def __init__(self):
+        self.rx = bytearray()
+        self.writes = []
+
+    @property
+    def in_waiting(self):
+        return len(self.rx)
+
+    def read(self, size):
+        data = bytes(self.rx[:size])
+        del self.rx[:size]
+        return data
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.is_open = False
+
+
+@pytest.fixture()
+def transfer_connection():
+    state.disconnect()
+    fake = _TransferMemorySerial()
+    state.ser = fake
+    state.transfer_active.clear()
+    state._transfer_cleanup_paths = []
+    with state.session_lock:
+        state.session_clients.clear()
+    try:
+        yield fake
+    finally:
+        state.disconnect()
+        state.ser = None
+        state.transfer_active.clear()
+        with state.session_lock:
+            state.session_clients.clear()
+
+
+def test_transfer_capabilities_and_shared_io_gating(transfer_connection):
+    capabilities = getattr(server.file_transfer_capabilities, "fn", server.file_transfer_capabilities)
+    assert "confirm_shared_quiescence=true" in capabilities()
+    client, peer = socket.socketpair()
+    client.settimeout(1)
+    with state.session_lock:
+        state.session_clients.add(client)
+    state.session_running.set()
+    state.session_path = "/synthetic/session.sock"
+    before_writes = list(transfer_connection.writes)
+    try:
+        deadline, error = state._transfer_begin(2)
+        assert error is None and deadline is not None, error
+        assert state.transfer_active.is_set()
+        # A server-owned pty/socket client's bytes are discarded during the
+        # transfer, never queued to corrupt the shell protocol.
+        state._session_user_write(b"must-not-reach-device")
+        assert transfer_connection.writes == before_writes
+        start_notice = peer.recv(4096)
+        assert b"input is temporarily paused" in start_notice
+        assert state._session_transfer_dropped_bytes == len(b"must-not-reach-device")
+        state._transfer_end()
+        end_notice = peer.recv(4096)
+        assert b"terminal input resumed" in end_notice and b"discarded" in end_notice
+        assert not state.transfer_active.is_set()
+
+        # External tio raw sockets cannot arbitrate with human clients. The
+        # transfer is refused by default and requires explicit idle confirmation.
+        state.session_running.clear()
+        state.session_path = None
+        state.transport.kind = "attach"
+        _, error = state._transfer_begin(2)
+        assert "confirm_shared_quiescence=true" in error
+        deadline, error = state._transfer_begin(2, confirm_shared_quiescence=True)
+        assert error is None and deadline is not None, error
+        state._transfer_end()
+    finally:
+        if state.transfer_active.is_set():
+            state._transfer_end()
+        state.session_running.clear()
+        state.session_path = None
+        with state.session_lock:
+            state.session_clients.discard(client)
+        client.close()
+        peer.close()
+
+
+def test_uboot_md_dump_parses_exact_bytes_and_rejects_missing_rows(transfer_connection, monkeypatch):
+    output = (
+        b"md.b 0x1000 10\r\n"
+        b"00001000: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f    ................\r\n"
+        b"=> "
+    )
+    monkeypatch.setattr(state, "_transfer_read_regex", lambda *args, **kwargs: output)
+    data, strength = state._download_uboot("1000", 16, re.compile(rb"=>\s*$"), time.monotonic() + 2)
+    assert data == bytes(range(16))
+    assert "no end-to-end checksum" in strength
+
+    malformed = b"00001000: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\r\n00001020: 10\r\n=> "
+    monkeypatch.setattr(state, "_transfer_read_regex", lambda *args, **kwargs: malformed)
+    with pytest.raises(ValueError, match="address row"):
+        state._download_uboot("1000", 17, re.compile(rb"=>\s*$"), time.monotonic() + 2)
+
+
+def test_uboot_ymodem_crc_retry_and_ram_readback(tmp_path, monkeypatch, transfer_connection):
+    import re
+
+    assert state._ymodem_crc(b"123456789") == 0x31C3
+    local = tmp_path / "ram.bin"
+    payload = b"\x00\xffA"
+    local.write_bytes(payload)
+    writes = []
+    transfer_started = False
+
+    def fake_write(data):
+        nonlocal transfer_started
+        writes.append(bytes(data))
+        if data.startswith(b"loady "):
+            transfer_started = True
+
+    monkeypatch.setattr(state, "_transfer_write", fake_write)
+    handshake = iter([b"## Ready for download\r\nC", b""])
+    monkeypatch.setattr(state, "_transfer_read", lambda size=4096: next(handshake, b"") if transfer_started else b"")
+    replies = iter([0x06, 0x43, 0x15, 0x06, 0x06, 0x06])
+    monkeypatch.setattr(state, "_ymodem_wait", lambda *args, **kwargs: next(replies))
+    monkeypatch.setattr(state, "_transfer_read_regex", lambda *args, **kwargs: b"Bytes transferred: 3\r\nU-Boot> ")
+    monkeypatch.setattr(state, "_download_uboot", lambda addr, length, prompt, deadline: (payload, "exact readback"))
+    result = state.upload_file(str(local), "test.bin", target="uboot", address="0x1000", prompt_regex=r"U-Boot>\s*$", timeout=3)
+    assert "exact RAM readback verified" in result
+    packets = [w for w in writes if w and w[0] in (0x01, 0x02)]
+    assert packets[0][0:3] == bytes((0x01, 0x00, 0xff))
+    data_packets = [packet for packet in packets if packet[0] == 0x02]
+    assert len(data_packets) == 2 and data_packets[0] == data_packets[1]
+    assert data_packets[0][3:6] == payload
+    assert b"loady 0x1000\r" in writes[0]
+
+
+def test_interrupted_transfer_releases_exclusive_state(tmp_path, monkeypatch, transfer_connection):
+    local = tmp_path / "input.bin"
+    local.write_bytes(b"synthetic")
+    monkeypatch.setattr(state, "_upload_linux", lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("peer stopped")))
+    result = state.upload_file(str(local), "/target", timeout=2)
+    assert result.startswith("Error:") and "peer stopped" in result
+    assert not state.transfer_active.is_set()
+    assert state.operation_lock.acquire(blocking=False)
+    state.operation_lock.release()
+    assert state.io_lock.acquire(blocking=False)
+    state.io_lock.release()
+
+
+def test_transfer_timeout_and_tool_schema(transfer_connection):
+    state.transfer_active.set()
+    assert "file transfer" in state.send_command("must-not-write")
+    assert "file transfer" in state.read_output()
+    state.transfer_active.clear()
+    with pytest.raises(TimeoutError, match="timed out"):
+        state._transfer_read_marker(b"never", time.monotonic() - 1, 10)
+    if hasattr(server.mcp, "get_tools"):
+        tools = asyncio.run(server.mcp.get_tools())
+        by_name = tools if isinstance(tools, dict) else {item.name: item for item in tools}
+    else:
+        by_name = {item.name: item for item in asyncio.run(server.mcp.list_tools())}
+    for name, expected in (("upload_file", {"local_path", "target_path", "target", "address", "overwrite", "confirm_shared_quiescence"}),
+                           ("download_file", {"local_path", "target", "target_path", "address", "length", "overwrite", "confirm_shared_quiescence"})):
+        schema = getattr(by_name[name], "parameters", None) or by_name[name].inputSchema
+        assert expected <= set(schema["properties"])
+
+
+def _mcp_text(result):
+    return "\\n".join(getattr(item, "text", "") for item in result.content)
+
+
+def _pty_target_peer(target, master_or_slave, **options):
+    return UBootPeer(master_or_slave, **options)
+
+
+@pytest.mark.parametrize("mode", ["direct", "attach"])
+@pytest.mark.parametrize("target", ["uboot"])
+def test_mcp_upload_download_direct_and_attach_pty_peers(tmp_path, mode, target):
+    payload = bytes(range(256)) + b"\x00\xff\r\n\x04" + bytes(reversed(range(256)))
+    source = tmp_path / "mcp-fixture.bin"
+    destination = tmp_path / f"{mode}-{target}-download.bin"
+    source.write_bytes(payload)
+    peer = None
+    owner = None
+    direct_fds = ()
+    if mode == "direct":
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        peer = _pty_target_peer(target, master)
+        direct_fds = (master, slave)
+        connect_args = {"port": os.ttyname(slave), "session_socket": ""}
+    else:
+        owner = FakeSessionOwner(str(tmp_path / "tio-like.sock"))
+        tty.setraw(owner.device_slave)
+        peer = _pty_target_peer(target, owner.device_slave)
+        connect_args = {"attach_socket": owner.path}
+    remote_path = f"/tmp/serial-mcp-{mode}-{target}-fixture.bin"
+    prompt = r"=>\s*$"
+
+    async def exercise():
+        async with Client(server.mcp) as client:
+            exposed = {tool.name for tool in await client.list_tools()}
+            assert {"upload_file", "download_file", "file_transfer_capabilities"} <= exposed
+            connected = await client.call_tool("connect", connect_args)
+            assert "Error" not in _mcp_text(connected), _mcp_text(connected)
+            try:
+                if mode == "attach":
+                    refused = await client.call_tool("upload_file", {
+                        "local_path": str(source), "target_path": remote_path,
+                        "target": target, "address": "0x1000", "timeout": 10,
+                    })
+                    assert "confirm_shared_quiescence=true" in _mcp_text(refused)
+                upload_args = {
+                    "local_path": str(source), "target": target, "timeout": 15,
+                    "max_bytes": 8192, "overwrite": False,
+                }
+                if target == "linux":
+                    upload_args["target_path"] = remote_path
+                else:
+                    upload_args.update({"target_path": "fixture.bin", "address": "0x1000", "prompt_regex": prompt})
+                if mode == "attach":
+                    upload_args["confirm_shared_quiescence"] = True
+                uploaded = await client.call_tool("upload_file", upload_args)
+                upload_text = _mcp_text(uploaded)
+                assert "Uploaded 517 bytes" in upload_text, upload_text
+                if target == "linux":
+                    rejected = await client.call_tool("upload_file", upload_args)
+                    assert "not overwritten" in _mcp_text(rejected)
+                    download_args = {
+                        "local_path": str(destination), "target": target,
+                        "target_path": remote_path, "overwrite": True,
+                        "timeout": 15, "max_bytes": 8192,
+                    }
+                else:
+                    missing_address = dict(upload_args)
+                    missing_address["address"] = None
+                    missing_address.pop("confirm_shared_quiescence", None)
+                    if mode == "attach":
+                        missing_address["confirm_shared_quiescence"] = True
+                    rejected = await client.call_tool("upload_file", missing_address)
+                    assert "explicit hexadecimal address" in _mcp_text(rejected)
+                    download_args = {
+                        "local_path": str(destination), "target": target,
+                        "address": "0x1000", "length": len(payload),
+                        "prompt_regex": prompt, "overwrite": True,
+                        "timeout": 15, "max_bytes": 8192,
+                    }
+                if mode == "attach":
+                    download_args["confirm_shared_quiescence"] = True
+                downloaded = await client.call_tool("download_file", download_args)
+                download_text = _mcp_text(downloaded)
+                assert downloaded.is_error is False and "Downloaded 517 bytes" in download_text, download_text
+                if target == "linux":
+                    recovered = await client.call_tool("send_command", {
+                        "text": "echo after-transfer", "line_ending": "cr", "timeout": 3,
+                        "idle_timeout": 0.1,
+                    })
+                    assert "after-transfer" in _mcp_text(recovered)
+                else:
+                    recovered = await client.call_tool("send_command", {
+                        "text": "md.b 0x1000 10", "line_ending": "cr", "timeout": 3,
+                        "idle_timeout": 0.1,
+                    })
+                    assert "00001000:" in _mcp_text(recovered)
+            finally:
+                await client.call_tool("disconnect", {})
+        return True
+
+    try:
+        asyncio.run(exercise())
+        assert destination.read_bytes() == payload
+        if mode == "attach":
+            assert owner.alive, "disconnecting an attach must not stop the tio-like owner"
+    finally:
+        if peer:
+            peer.close()
+        if owner:
+            owner.close()
+        for fd in direct_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_mcp_openssl_only_real_interactive_shell_with_echo_wrapping(tmp_path):
+    import shutil
+    payload = bytes(range(256)) + b"\x00\xff\r\n\x04" + bytes(reversed(range(256)))
+    source = tmp_path / "interactive-fixture.bin"
+    destination = tmp_path / "interactive-down.bin"
+    target_path = str(tmp_path / "remote ' path with spaces.bin")
+    source.write_bytes(payload)
+    command_dir = tmp_path / "target-bin"
+    command_dir.mkdir()
+    # Simulate a constrained BusyBox-like target PATH: no stty or sha256sum.
+    for name in ("cat", "base64", "openssl", "ln", "mv", "rm", "wc"):
+        binary = shutil.which(name)
+        assert binary, f"host test prerequisite missing: {name}"
+        (command_dir / name).symlink_to(binary)
+    owner = InteractiveShellTioOwner(path=str(command_dir))
+    try:
+        async def exercise():
+            async with Client(server.mcp) as client:
+                connected = await client.call_tool("connect", {"attach_socket": owner.path})
+                assert "Attached" in _mcp_text(connected)
+                up = await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": target_path,
+                    "confirm_shared_quiescence": True, "overwrite": False,
+                    "timeout": 45, "max_bytes": 8192,
+                })
+                assert "Uploaded 517 bytes" in _mcp_text(up), _mcp_text(up)
+                down = await client.call_tool("download_file", {
+                    "local_path": str(destination), "target": "linux", "target_path": target_path,
+                    "confirm_shared_quiescence": True, "overwrite": True,
+                    "timeout": 45, "max_bytes": 8192,
+                })
+                assert "Downloaded 517 bytes" in _mcp_text(down), _mcp_text(down)
+                await client.call_tool("disconnect", {})
+        asyncio.run(exercise())
+        assert destination.read_bytes() == payload
+    finally:
+        state.disconnect()
+        owner.close()
+
+
+def test_attach_interrupted_uboot_transfer_cancels_loady_and_restores_io(tmp_path):
+    owner = FakeSessionOwner(str(tmp_path / "owner.sock"))
+    tty.setraw(owner.device_slave)
+    peer = UBootPeer(owner.device_slave, reject_data=True)
+    source = tmp_path / "uboot-interrupt.bin"
+    source.write_bytes(bytes(range(32)))
+    try:
+        async def exercise():
+            async with Client(server.mcp) as client:
+                connected = await client.call_tool("connect", {"attach_socket": owner.path})
+                assert "Attached" in _mcp_text(connected)
+                failed = await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "uboot", "target_path": "reject.bin",
+                    "address": "0x1000", "prompt_regex": r"=>\s*$",
+                    "confirm_shared_quiescence": True, "timeout": 10, "max_bytes": 1024,
+                })
+                failed_text = _mcp_text(failed)
+                assert "during uboot-ymodem-data" in failed_text and "YMODEM block 1" in failed_text and "Partial volatile RAM" in failed_text, failed_text
+                assert not state.transfer_active.is_set()
+                recovered = await client.call_tool("send_command", {
+                    "text": "md.b 0x1000 10", "line_ending": "cr", "timeout": 3,
+                    "idle_timeout": 0.1,
+                })
+                assert "=>" in _mcp_text(recovered)
+                await client.call_tool("disconnect", {})
+        asyncio.run(exercise())
+        assert owner.alive
+    finally:
+        state.disconnect()
+        peer.close()
+        owner.close()
+
+
+# ---- real interactive shell over PTY and raw socket -----------------------
+#
+# These tests run an actual /bin/sh (dash here; BusyBox ash was not available
+# on this host) with canonical input, echo, and ISIG, behind either a separate
+# device PTY that the server opens directly or a tio-like raw UNIX socket. The
+# fake command parser used earlier could not reproduce the target failures, so
+# every Linux transfer path below drives real shell line handling.
+
+REAL_SHELL_TOOLS = ("cat", "base64", "openssl", "ln", "mv", "rm", "wc", "sha256sum")
+PAYLOAD_517 = bytes(range(256)) + b"\x00\xff\r\n\x04" + bytes(reversed(range(256)))
+
+
+def _open_real_target(mode, tmp_path, names=REAL_SHELL_TOOLS, shims=None, pace=0.0):
+    """Return (connect arguments, close callable) for a real-shell target."""
+    bindir = build_target_bin(tmp_path / "target-bin", names, shims)
+    if mode == "direct":
+        device = RealShellDevice(bindir, pace=pace)
+        return {"port": device.device_path, "session_socket": ""}, device.close
+    owner = InteractiveShellTioOwner(
+        socket_path=str(tmp_path / "tio-like.sock"), path=bindir, pace=pace,
+    )
+    return {"attach_socket": owner.path}, owner.close
+
+
+def _staging_leftovers(directory):
+    return sorted(p.name for p in Path(directory).iterdir() if p.name.startswith(".serial-mcp-"))
+
+
+def _sha256_shim(wrong_digest_for_files):
+    import shutil
+    real = shutil.which("sha256sum")
+    assert real, "host prerequisite missing: sha256sum"
+    if not wrong_digest_for_files:
+        return None
+    return (
+        "#!/bin/sh\n"
+        "if [ \"$#\" -gt 0 ]; then\n"
+        "  echo \"0000000000000000000000000000000000000000000000000000000000000000  $1\"\n"
+        "else\n"
+        f"  exec {real}\n"
+        "fi\n"
+    )
+
+
+@pytest.mark.parametrize("mode", ["direct", "attach"])
+def test_real_shell_linux_round_trip_binary_and_recovery(tmp_path, mode):
+    source = tmp_path / "real-source.bin"
+    source.write_bytes(PAYLOAD_517)
+    remote_dir = tmp_path / "target dir"
+    remote_dir.mkdir()
+    remote = remote_dir / "remote fixture.bin"
+    destination = tmp_path / f"{mode}-download.bin"
+    connect_args, close = _open_real_target(mode, tmp_path)
+    confirm = {"confirm_shared_quiescence": True} if mode == "attach" else {}
+
+    async def exercise():
+        async with Client(server.mcp) as client:
+            connected = _mcp_text(await client.call_tool("connect", connect_args))
+            assert "Error" not in connected, connected
+            try:
+                up = _mcp_text(await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": str(remote),
+                    "overwrite": False, "timeout": 60, "max_bytes": 8192, **confirm,
+                }))
+                assert up.startswith("Uploaded 517 bytes"), up
+                assert "matched the local file via sha256sum" in up, up
+                down = _mcp_text(await client.call_tool("download_file", {
+                    "local_path": str(destination), "target": "linux", "target_path": str(remote),
+                    "overwrite": True, "timeout": 60, "max_bytes": 8192, **confirm,
+                }))
+                assert down.startswith("Downloaded 517 bytes"), down
+                recovered = _mcp_text(await client.call_tool("send_command", {
+                    "text": "echo after-transfer", "line_ending": "cr", "timeout": 5, "idle_timeout": 0.2,
+                }))
+                assert "after-transfer" in recovered, recovered
+            finally:
+                await client.call_tool("disconnect", {})
+
+    try:
+        asyncio.run(exercise())
+        assert destination.read_bytes() == PAYLOAD_517
+        assert remote.read_bytes() == PAYLOAD_517
+        assert _staging_leftovers(remote_dir) == []
+    finally:
+        state.disconnect()
+        close()
+
+
+@pytest.mark.parametrize("mode", ["direct", "attach"])
+def test_real_shell_openssl_only_target_without_sha256sum(tmp_path, mode):
+    source = tmp_path / "openssl-only.bin"
+    source.write_bytes(PAYLOAD_517)
+    remote = tmp_path / "openssl-only-remote.bin"
+    destination = tmp_path / "openssl-only-download.bin"
+    names = tuple(n for n in REAL_SHELL_TOOLS if n != "sha256sum")
+    connect_args, close = _open_real_target(mode, tmp_path, names=names)
+    confirm = {"confirm_shared_quiescence": True} if mode == "attach" else {}
+
+    async def exercise():
+        async with Client(server.mcp) as client:
+            assert "Error" not in _mcp_text(await client.call_tool("connect", connect_args))
+            try:
+                up = _mcp_text(await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": str(remote),
+                    "overwrite": False, "timeout": 60, "max_bytes": 8192, **confirm,
+                }))
+                assert up.startswith("Uploaded 517 bytes") and "via openssl" in up, up
+                down = _mcp_text(await client.call_tool("download_file", {
+                    "local_path": str(destination), "target": "linux", "target_path": str(remote),
+                    "overwrite": True, "timeout": 60, "max_bytes": 8192, **confirm,
+                }))
+                assert down.startswith("Downloaded 517 bytes") and "hash tool: openssl" in down, down
+            finally:
+                await client.call_tool("disconnect", {})
+
+    try:
+        asyncio.run(exercise())
+        assert destination.read_bytes() == PAYLOAD_517
+    finally:
+        state.disconnect()
+        close()
+
+
+def test_real_shell_wrong_hash_installs_nothing_and_cleans_staging(tmp_path):
+    source = tmp_path / "bad-hash-source.bin"
+    source.write_bytes(PAYLOAD_517)
+    remote_dir = tmp_path / "bad-hash-dir"
+    remote_dir.mkdir()
+    remote = remote_dir / "never-installed.bin"
+    shim = _sha256_shim(wrong_digest_for_files=True)
+    connect_args, close = _open_real_target("direct", tmp_path, shims={"sha256sum": shim})
+
+    async def exercise():
+        async with Client(server.mcp) as client:
+            assert "Error" not in _mcp_text(await client.call_tool("connect", connect_args))
+            try:
+                result = _mcp_text(await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": str(remote),
+                    "overwrite": False, "timeout": 60, "max_bytes": 8192,
+                }))
+                assert "did not match" in result and "nothing was installed" in result, result
+                assert "The install was not attempted" in result, result
+                assert "Staging files were removed" in result, result
+            finally:
+                await client.call_tool("disconnect", {})
+
+    try:
+        asyncio.run(exercise())
+        assert not remote.exists()
+        assert _staging_leftovers(remote_dir) == []
+    finally:
+        state.disconnect()
+        close()
+
+
+def test_real_shell_no_clobber_keeps_existing_destination(tmp_path):
+    source = tmp_path / "noclobber-source.bin"
+    source.write_bytes(PAYLOAD_517)
+    remote = tmp_path / "existing-destination.bin"
+    remote.write_bytes(b"keep-me")
+    connect_args, close = _open_real_target("direct", tmp_path)
+
+    async def exercise():
+        async with Client(server.mcp) as client:
+            assert "Error" not in _mcp_text(await client.call_tool("connect", connect_args))
+            try:
+                result = _mcp_text(await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": str(remote),
+                    "overwrite": False, "timeout": 60, "max_bytes": 8192,
+                }))
+                assert "was not overwritten" in result, result
+                assert "Staging files were removed" in result, result
+            finally:
+                await client.call_tool("disconnect", {})
+
+    try:
+        asyncio.run(exercise())
+        assert remote.read_bytes() == b"keep-me"
+        assert _staging_leftovers(tmp_path) == []
+    finally:
+        state.disconnect()
+        close()
+
+
+@pytest.mark.parametrize("mode", ["direct", "attach"])
+def test_real_shell_interrupted_stream_recovers_prompt_and_cleans_staging(tmp_path, mode):
+    source = tmp_path / "interrupted.bin"
+    source.write_bytes(os.urandom(6000))
+    remote = tmp_path / "interrupted-remote.bin"
+    connect_args, close = _open_real_target(mode, tmp_path, pace=0.02)
+    confirm = {"confirm_shared_quiescence": True} if mode == "attach" else {}
+
+    async def exercise():
+        async with Client(server.mcp) as client:
+            assert "Error" not in _mcp_text(await client.call_tool("connect", connect_args))
+            try:
+                failed = _mcp_text(await client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": str(remote),
+                    "overwrite": False, "timeout": 4, "max_bytes": 8192, **confirm,
+                }))
+                assert "failed during linux-stream" in failed, failed
+                assert "Staging files were removed" in failed, failed
+                assert "The install was not attempted" in failed, failed
+                alive = _mcp_text(await client.call_tool("send_command", {
+                    "text": "echo ALIVE", "line_ending": "cr", "timeout": 5, "idle_timeout": 0.3,
+                }))
+                assert "ALIVE" in alive, alive
+            finally:
+                await client.call_tool("disconnect", {})
+
+    try:
+        asyncio.run(exercise())
+        assert not remote.exists()
+        assert _staging_leftovers(tmp_path) == []
+    finally:
+        state.disconnect()
+        close()
+
+
+def test_real_shell_continuation_prompt_needs_only_ctrl_c(tmp_path):
+    connect_args, close = _open_real_target("direct", tmp_path)
+    try:
+        assert state.connect(**connect_args).startswith("Connected")
+        deadline, error = state._transfer_begin(10)
+        assert error is None, error
+        try:
+            state._transfer_write(b'printf "unterminated\r')
+            assert state._settle_prompt(b"", 1.0) == "continuation"
+            assert state._settle_prompt(b"\x03", 1.0) == "primary"
+        finally:
+            state._transfer_end()
+    finally:
+        state.disconnect()
+        close()
+
+
+def test_real_shell_long_control_line_is_refused_before_any_byte_is_sent(tmp_path, monkeypatch):
+    source = tmp_path / "long-path-source.bin"
+    source.write_bytes(PAYLOAD_517)
+    connect_args, close = _open_real_target("direct", tmp_path)
+    writes = []
+    original = state._transfer_write
+    try:
+        assert state.connect(**connect_args).startswith("Connected")
+        monkeypatch.setattr(state, "_transfer_write", lambda data: (writes.append(bytes(data)), original(data)))
+        result = state.upload_file(str(source), str(tmp_path / ("x" * 260)), timeout=10, max_bytes=8192)
+        assert "240-byte limit" in result and "shorter target path" in result, result
+        assert writes == [], "no target bytes may be sent for an over-long control line"
+    finally:
+        monkeypatch.setattr(state, "_transfer_write", original)
+        state.disconnect()
+        close()
+
+
+def test_control_line_keeps_marker_out_of_its_own_echo():
+    wire, marker = state._control_wire("printf x | sha256sum")
+    text = wire.decode("utf-8")
+    assert marker.decode("ascii") not in text
+    assert text.endswith("\r") and len(wire) - 1 <= state.MAX_LINUX_COMMAND_BYTES
+    assert "RC:%s" in text
+
+
+def test_diagnostics_redact_base64_payload_but_keep_stage_names():
+    state._reset_transfer_trace()
+    state._trace("linux-stream", "684-chars")
+    state._transfer_recent.extend(b"QUJD" * 40 + b" tail")
+    summary = state._trace_summary()
+    assert "QUJDQUJD" not in summary
+    assert "<b64-redacted>" in summary and "linux-stream:684-chars" in summary
+
+
+@pytest.mark.parametrize("mode", ["direct"])
+def test_real_shell_own_session_gates_human_input_during_upload(tmp_path, mode):
+    payload = os.urandom(2000)
+    source = tmp_path / "gated-source.bin"
+    source.write_bytes(payload)
+    remote = tmp_path / "gated-remote.bin"
+    session_path = str(tmp_path / "owned-session.sock")
+    bindir = build_target_bin(tmp_path / "target-bin", REAL_SHELL_TOOLS)
+    if mode == "direct":
+        device = RealShellDevice(bindir, pace=0.02)
+        connect_args, close = {"port": device.device_path, "session_socket": session_path}, device.close
+    else:
+        owner = InteractiveShellTioOwner(socket_path=str(tmp_path / "tio-like.sock"), path=bindir, pace=0.02)
+        connect_args, close = {"attach_socket": owner.path}, owner.close
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(1)
+    result_box = {}
+
+    def upload_in_thread():
+        async def call():
+            async with Client(server.mcp) as mcp_client:
+                result_box["text"] = _mcp_text(await mcp_client.call_tool("upload_file", {
+                    "local_path": str(source), "target": "linux", "target_path": str(remote),
+                    "overwrite": False, "timeout": 60, "max_bytes": 8192,
+                    **({"confirm_shared_quiescence": True} if mode == "attach" else {}),
+                }))
+        asyncio.run(call())
+
+    try:
+        connected = state.connect(**connect_args) if mode == "direct" else state.attach(attach_socket=connect_args["attach_socket"])
+        assert connected.startswith(("Connected", "Attached")), connected
+        if mode == "direct":
+            client.connect(session_path)
+            deadline = time.monotonic() + 3
+            while not state.session_clients and time.monotonic() < deadline:
+                time.sleep(0.01)
+        thread = threading.Thread(target=upload_in_thread, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 20
+        while state._transfer_stage != "linux-stream" and time.monotonic() < deadline and thread.is_alive():
+            time.sleep(0.005)
+        if mode == "direct":
+            client.sendall(b"HUMAN-INPUT-MUST-NOT-REACH-SHELL\r")
+        thread.join(timeout=90)
+        assert not thread.is_alive(), "upload did not finish"
+        assert "Uploaded 2000 bytes" in result_box.get("text", ""), result_box
+        assert remote.read_bytes() == payload, "human input reached the shell during the transfer"
+        assert _staging_leftovers(tmp_path / "") == []
+        if mode == "direct":
+            notices = bytearray()
+            end = time.monotonic() + 1.5
+            while time.monotonic() < end:
+                try:
+                    notices.extend(client.recv(4096))
+                except socket.timeout:
+                    break
+            assert b"input is temporarily paused" in notices
+            assert b"resumed" in notices
+    finally:
+        state.disconnect()
+        client.close()
+        close()

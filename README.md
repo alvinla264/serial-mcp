@@ -206,13 +206,16 @@ Or poke the session directly (same raw protocol):
 
 `disconnect` closes the device and drops all attached clients.
 
-> **Only one process can hold the serial device, and the server enforces it.**
-> ttys are not exclusive-open — `pyserial` will happily open a port another
-> process already holds, after which the two interleave bytes on the wire — so
-> the server takes an advisory lock per device instead. If something else holds
-> it, `connect(port=...)` fails and names the holder's pid and command rather
-> than sharing the port. The kernel releases the lock when the holder exits, so a
-> crashed server never leaves the port blocked.
+> **Direct connections refuse an already-open serial device.** On Linux the
+> server claims `TIOCEXCL` before configuring/reading the tty and checks visible
+> open handles by device number, so symlink aliases are covered. A process that
+> already owns the tty (including `tio`) is reported with a PID/name and is not
+> read, flushed, disconnected, or reconfigured. If it serves a tio socket, use
+> `attach`; otherwise ask its owner to close the port before retrying. An
+> additional device-number advisory lock coordinates serial-mcp instances only;
+> it is not treated as proof of ownership. Direct open fails closed on platforms
+> where this Linux exclusivity/owner check is unavailable. Privileged processes
+> able to bypass `TIOCEXCL` remain an OS-level limitation.
 >
 > **A live session is never taken over.** If a session socket is already being
 > served — by your own tio, or by another agent — `connect(port=...)` refuses
@@ -336,6 +339,123 @@ Custom profiles go in `~/.config/serial-mcp/profiles.json`:
 
 Then: `set_boot_credentials("mydevice", "root", "…")` once, and the AI can
 just call `enter_bootloader(profile="mydevice")`.
+
+## Binary file transfer
+
+File transfers use `upload_file` and `download_file`; the local side is always a
+filesystem path visible to the MCP server process, so file bytes do not need to
+be pasted into model context. Query `file_transfer_capabilities()` before using
+a target. Transfers are bounded to 8 MiB by default and at most 8 MiB per call;
+the overall timeout is bounded to 1–1800 seconds. Direct connections may retain
+their server-owned socket/pty clients: the server pauses device RX and gates its
+own client writers during the transfer. Attached sessions are also supported with
+`confirm_shared_quiescence=true`, but tio's raw socket protocol has no arbitration
+or client-identity frame. Before confirming, ensure every human/other client will
+remain idle for the entire transfer. A conflicting client may corrupt the session;
+Linux verification prevents installing mismatched files, and U-Boot upload verifies
+RAM readback, but competing input cannot be prevented or guaranteed recoverable.
+Transfer bytes are suppressed from logs and `view_io`; own-session users receive
+an out-of-band notice and keystrokes during the gated interval are discarded.
+
+### Linux shell
+
+Requires an interactive POSIX shell with `cat`, `base64 -d`, and either a working
+`sha256sum` or `openssl dgst -sha256`, reached through direct ownership or an
+attached tio session (with shared-client quiescence confirmed). `sha256sum` is
+preferred; OpenSSL is used only if sha256sum is absent or fails its known-output
+probe. Each tool is selected only after its digest and exit status are checked.
+
+**How the target shell is driven.** Interactive shells echo and wrap input and
+can behave differently when a line is long, so the protocol keeps every control
+line short:
+
+- Every control line is at most 240 bytes and is refused before anything is
+  sent if it would be longer. The directory and file names are set once in
+  `SMC_*` shell variables (`SMC_D`, `SMC_T`, `SMC_B`, `SMC_F`), so lines do not
+  repeat long paths. For the coordinator's `/tmp/serial-mcp-live-*.bin` path the
+  longest control line measured 201 bytes in a longer scratch directory.
+- Each line reports its exit status as `RC:<n>` and ends with a marker printed
+  through `printf '%s'`, so the echoed command never contains the marker.
+- Before any transfer step the shell must show its primary prompt. A continuation
+  prompt (`> `) means input is still pending: only Ctrl-C is sent. EOF (Ctrl-D)
+  is sent only into a `cat` this server started, never into a shell.
+- Upload stages: prompt sync, capability probe, `cat` ready marker, streamed
+  base64 (256-character lines, echo drained between lines), EOF, decode, length
+  check, SHA-256 check, install (`ln` for no-clobber, `mv -f` for overwrite), and
+  cleanup. Nothing is installed unless the staged file's length and digest match.
+  A failure before install leaves the destination untouched and removes only the
+  two staging names. A failure after install begins is reported as UNKNOWN.
+- Download reads size, digest, and base64 in separate short lines, then verifies
+  length and SHA-256 locally before atomically creating or replacing the file.
+
+Failure messages name the stage, the number of command bytes, and a redacted RX
+tail (base64-looking runs are replaced by `<b64-redacted>`), so diagnostics never
+include file content.
+
+```text
+upload_file(local_path="./firmware.bin", target="linux",
+            target_path="/tmp/firmware.bin", overwrite=false)
+download_file(local_path="./capture.bin", target="linux",
+              target_path="/tmp/capture.bin")
+```
+
+**Requirements and limits.** The shell must be at its prompt, and nobody should
+type during the transfer. For an attached tio session, pass
+`confirm_shared_quiescence=true`; the raw socket cannot enforce this. Linux
+tests run a real `/bin/sh` (dash) over PTYs and a tio-like socket, including
+OpenSSL-only and constrained-PATH targets, paced links, and interrupted streams.
+BusyBox ash was not available on the test host, so ash line-editing limits remain
+unverified. Staging cleanup is best effort: if the shell cannot be returned to its
+primary prompt, the response names the staging files so an operator can remove
+them after pressing Ctrl-C in tio.
+
+### U-Boot RAM
+
+U-Boot is not treated as a filesystem. Upload requires the target's `loady`
+command compiled with YMODEM/CRC support; it transfers to a **required explicit
+RAM address** and verifies the bytes by reading the range back with `md.b`.
+`target_path` is only the simple ASCII YMODEM transfer filename. Before choosing
+an address, the operator must confirm the range is writable and does not overlap
+U-Boot, its stack, relocation area, or other live memory. No address is guessed.
+Download uses `md.b <address> <length>` and needs both the explicit address and
+byte length. `md.b` must produce standard address-colon hexadecimal rows, and a
+U-Boot prompt regex must be supplied or configured (anchor it to the end of the
+prompt, e.g. `U-Boot>\\s*$`). Upload verification is exact YMODEM packet CRC plus
+byte-for-byte RAM readback. Download verification is limited to parsed sequential
+addresses and exact byte count; `md.b` has no end-to-end checksum, so corrupted
+text that remains syntactically plausible cannot be ruled out.
+
+```text
+upload_file(local_path="./blob.bin", target="uboot", target_path="blob.bin",
+            address="0x82000000", prompt_regex="U-Boot>\\s*$")
+download_file(local_path="./ram.bin", target="uboot", address="0x82000000",
+              length=4096, prompt_regex="U-Boot>\\s*$")
+```
+
+The address in these examples is illustrative only; select a safe range for the
+specific board. `loady` changes volatile RAM only. For attach-mode U-Boot, pass
+`confirm_shared_quiescence=true` and ensure other tio clients stay idle; interrupted
+uploads can leave partial volatile RAM changed. The tools do not write flash,
+execute memory, reboot, or change persistent U-Boot environment variables. A
+U-Boot build without `loady` cannot upload via this implementation; there is no
+assumed generic U-Boot serial-send command. Use a target-specific supported
+loader or a different physical transport if `loady` is absent.
+
+### Support matrix and limits
+
+| Target | Upload | Download | Requirements | Verification |
+|---|---|---|---|---|
+| Linux shell | base64 to temp then install | target base64 to local temp | `cat`, `base64 -d`, working `sha256sum` or `openssl dgst -sha256`; direct ownership or attached session with confirmed idle co-users | SHA-256 + exact length both ways |
+| U-Boot | YMODEM via `loady` to explicit RAM address | `md.b` of explicit RAM address/length | YMODEM-enabled `loady`, `md.b`, explicit range, prompt regex; attached sessions require idle co-users | upload readback is byte-exact; download only address/length |
+| Attach/shared session | Supported with `confirm_shared_quiescence=true` | Supported with `confirm_shared_quiescence=true` | Raw tio socket has no arbitration; all other clients must remain idle | protocol checks detect many collisions; interleaving is not prevented |
+
+The U-Boot examples also work in attach mode by adding `confirm_shared_quiescence=true`.
+`overwrite` applies to the Linux target for uploads and to the local destination
+for downloads. It does not apply to U-Boot RAM: upload replaces the selected
+volatile range, so select it deliberately. Transfer data itself is never added
+to serial logs or the I/O transcript. The user still grants the agent access to
+the named local file and target path/address; review paths, target capabilities,
+and memory ranges before invoking a transfer.
 
 ## Session protocol notes
 
