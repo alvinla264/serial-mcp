@@ -9,7 +9,10 @@ dependencies = [
 ]
 
 [project.scripts]
-serial-mcp = "server:main"
+# serial-mcp is the thin stdio MCP frontend of the shared daemon (docs/mcp-frontend.md).
+# serial-mcp-legacy keeps the previous in-process server (one device per MCP process).
+serial-mcp = "serial_mcp_client:main"
+serial-mcp-legacy = "server:main"
 serial-mcp-daemon = "serial_mcp_daemon:main"
 
 [build-system]
@@ -18,6 +21,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # Top-level modules at the wheel root so the console entry points resolve:
-# server (legacy MCP server), serial_mcp_ipc (stdlib-only IPC/client helpers)
-# and serial_mcp_daemon (shared daemon). See docs/daemon-ipc.md.
-include = ["server.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py"]
+# server (legacy MCP server), serial_mcp_client (stdio MCP frontend),
+# serial_mcp_ipc (stdlib-only IPC/client helpers) and serial_mcp_daemon (shared
+# daemon). See docs/daemon-ipc.md and docs/mcp-frontend.md.
+include = ["server.py", "serial_mcp_client.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py"]

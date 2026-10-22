@@ -31,14 +31,21 @@
           buildInputs = [ pythonEnv pkgs.makeWrapper ];
           installPhase = ''
             mkdir -p $out/bin $out/share/serial-mcp
-            # Modules live beside the launcher copy so both the legacy MCP
-            # server and the daemon (which imports server.py) resolve them.
-            cp server.py serial_mcp_ipc.py serial_mcp_daemon.py $out/share/serial-mcp/
-            cp server.py $out/bin/serial-mcp
+            # Modules live beside the launchers so the MCP frontend, the legacy
+            # MCP server and the daemon (which imports server.py) all resolve them.
+            cp server.py serial_mcp_client.py serial_mcp_ipc.py serial_mcp_daemon.py $out/share/serial-mcp/
+            # serial-mcp is the stdio MCP frontend of the shared daemon.
+            cp serial_mcp_client.py $out/bin/serial-mcp
             chmod +x $out/bin/serial-mcp
+            # serial-mcp-legacy is the previous in-process server (one device per MCP process).
+            cp server.py $out/bin/serial-mcp-legacy
+            chmod +x $out/bin/serial-mcp-legacy
 
-            # Wrap the script to use the correct python environment
+            # Wrap the scripts to use the correct python environment
             wrapProgram $out/bin/serial-mcp \
+              --prefix PATH : ${pythonEnv}/bin \
+              --prefix PYTHONPATH : $out/share/serial-mcp
+            wrapProgram $out/bin/serial-mcp-legacy \
               --prefix PATH : ${pythonEnv}/bin \
               --prefix PYTHONPATH : $out/share/serial-mcp
 
