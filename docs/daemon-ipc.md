@@ -47,8 +47,10 @@ Safety rules (enforced by both daemon and client helpers):
 - The daemon writes its own log to `<runtime dir>/daemon.log`; `SERIAL_MCP_DAEMON_LOG`
   overrides the path (tests use this). The legacy launcher keeps `/tmp/serial-mcp.log`
   (or `SERIAL_MCP_LOG` when set). A daemon sets `SERIAL_MCP_LOG` to its own log before
-  importing `server`, and it creates its state only after it holds the lock, so starting
-  a daemon never truncates the legacy log, and a daemon that loses the lock touches no log.
+  constructing its engine (`serial_mcp_engine.SerialState`, in `start()`, after it holds
+  the lock). Importing the daemon or the engine opens no log and loads no MCP framework,
+  so starting a daemon never truncates the legacy log, and a daemon that loses the lock
+  touches no log.
 - Any process running as the same user can connect and claim any role. The uid
   check and the `0600`/`0700` modes are the only boundary, and they are the same
   boundary that protects the legacy session files.

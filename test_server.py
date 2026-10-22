@@ -19,6 +19,7 @@ import asyncio
 from pathlib import Path
 
 import server
+import serial_mcp_engine
 from fastmcp import Client
 from server import state
 from transfer_test_support import (
@@ -626,15 +627,12 @@ def test_rx_logging_flushes_newline_free_partial_once_on_idle_and_disconnect():
 
 # ---- bootloader entry -------------------------------------------------------
 
-import server as _server_mod
-
-
 @pytest.fixture()
 def boot_creds(monkeypatch, tmp_path):
-    """Point config dir at a temp location."""
-    monkeypatch.setattr(_server_mod, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(_server_mod, "USER_PROFILES_PATH", tmp_path / "profiles.json")
-    monkeypatch.setattr(_server_mod, "CREDENTIALS_PATH", tmp_path / "credentials.json")
+    """Point config dir at a temp location (the engine owns these paths)."""
+    monkeypatch.setattr(serial_mcp_engine, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(serial_mcp_engine, "USER_PROFILES_PATH", tmp_path / "profiles.json")
+    monkeypatch.setattr(serial_mcp_engine, "CREDENTIALS_PATH", tmp_path / "credentials.json")
     return tmp_path
 
 
@@ -1172,7 +1170,7 @@ def test_connect_requires_a_target():
 
 def test_attach_auto_detection_finds_the_live_session(monkeypatch):
     with tempfile.TemporaryDirectory(prefix="smc") as d:
-        monkeypatch.setattr(server, "SESSION_SOCKET_DIR", d)
+        monkeypatch.setattr(serial_mcp_engine, "SESSION_SOCKET_DIR", d)
         owner = FakeSessionOwner(os.path.join(d, "serial-mcp-A.sock"))
         try:
             result = state.attach()  # no path: auto-detect
@@ -1185,7 +1183,7 @@ def test_attach_auto_detection_finds_the_live_session(monkeypatch):
 
 def test_attach_auto_detection_refuses_when_ambiguous(monkeypatch):
     with tempfile.TemporaryDirectory(prefix="smc") as d:
-        monkeypatch.setattr(server, "SESSION_SOCKET_DIR", d)
+        monkeypatch.setattr(serial_mcp_engine, "SESSION_SOCKET_DIR", d)
         a = FakeSessionOwner(os.path.join(d, "serial-mcp-A.sock"))
         b = FakeSessionOwner(os.path.join(d, "serial-mcp-B.sock"))
         try:
@@ -1201,7 +1199,7 @@ def test_attach_auto_detection_refuses_when_ambiguous(monkeypatch):
 
 def test_attach_auto_detection_reports_no_session(monkeypatch):
     with tempfile.TemporaryDirectory(prefix="smc") as d:
-        monkeypatch.setattr(server, "SESSION_SOCKET_DIR", d)
+        monkeypatch.setattr(serial_mcp_engine, "SESSION_SOCKET_DIR", d)
         state.disconnect()
         result = state.attach()
         assert result.startswith("Error: no live session socket"), result
@@ -1295,7 +1293,7 @@ def test_port_lock_blocks_a_second_owner(monkeypatch):
 
     master, slave = pty.openpty()
     port = os.ttyname(slave)
-    lock_path = server._serial_port_lock_path(server._serial_device_id(port))
+    lock_path = serial_mcp_engine._serial_port_lock_path(serial_mcp_engine._serial_device_id(port))
     try:
         # A different process holding the advisory lock stands in for a second
         # server. flock is per-open-file-description, so an independent fd here
@@ -1367,7 +1365,7 @@ def test_tio_first_direct_connect_refuses_alias_without_touching_owner(tmp_path)
         owner.wait(timeout=3)
         result = state.connect(port=str(alias), session_socket="")
         assert result.startswith("Connected"), result
-        assert state.transport.device_id == server._serial_device_id(port)
+        assert state.transport.device_id == serial_mcp_engine._serial_device_id(port)
     finally:
         state.disconnect()
         if owner.poll() is None:

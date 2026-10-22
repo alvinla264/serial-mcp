@@ -37,6 +37,7 @@ from collections import deque
 from pathlib import Path
 
 import serial_mcp_ipc as ipc
+from serial_mcp_engine import FILE_TRANSFER_CAPABILITIES, SerialState
 from serial_mcp_ipc import (
     DRAIN_TIMEOUT_SECONDS,
     GRACE_SECONDS,
@@ -409,8 +410,8 @@ class DaemonServer:
     ) -> None:
         self.runtime = Path(runtime) if runtime is not None else ipc.runtime_dir()
         self.clock = clock
-        # Created in start(), after the lock is held: importing ``server`` opens its
-        # log for writing, and a daemon that loses the lock must not touch it.
+        # Created in start(), after the lock is held: constructing SerialState truncates
+        # the log, and a daemon that loses the lock must not touch it.
         self.state = state
         self._start_housekeeping = start_housekeeping
         self._lock_fd: int | None = None
@@ -449,7 +450,7 @@ class DaemonServer:
         self._acquire_lock()
         try:
             if self.state is None:
-                from server import SerialState  # heavy import: only the daemon needs it
+                # The one engine this daemon owns. Built here, not at import time.
                 self.state = SerialState()
             self.state.rx_listeners.append(self._on_device_rx)
             self._bind()
@@ -826,7 +827,6 @@ class DaemonServer:
     def run_call(self, conn: Connection, rid, tool: str, args: dict) -> None:
         method_name, gated = TOOL_TABLE[tool]
         if method_name is None:
-            from server import FILE_TRANSFER_CAPABILITIES
             conn.send_result(rid, {"result": FILE_TRANSFER_CAPABILITIES})
             return
         method = getattr(self.state, method_name)
@@ -891,8 +891,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv)
 
     try:
-        # The daemon's log lives in its private runtime directory. Set before ``server``
-        # is imported, so the legacy module-level state never opens /tmp/serial-mcp.log.
+        # The daemon's log lives in its private runtime directory. Set before the engine
+        # is constructed in start(), so the log never lands in /tmp/serial-mcp.log.
         os.environ["SERIAL_MCP_LOG"] = os.environ.get("SERIAL_MCP_DAEMON_LOG") or str(
             ipc.runtime_dir() / "daemon.log")
         server = DaemonServer(start_housekeeping=True)

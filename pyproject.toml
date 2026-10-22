@@ -22,8 +22,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # Top-level modules at the wheel root so the console entry points resolve:
-# server (legacy MCP server), serial_mcp_client (stdio MCP frontend),
+# server (legacy MCP server, FastMCP adapter), serial_mcp_engine (device-agnostic
+# serial engine, no MCP), serial_mcp_client (stdio MCP frontend),
 # serial_mcp_ipc (stdlib-only IPC/client helpers), serial_mcp_daemon (shared
 # daemon) and serial_mcp_terminal (human terminal). See docs/daemon-ipc.md,
 # docs/mcp-frontend.md and docs/human-terminal.md.
-include = ["server.py", "serial_mcp_client.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py"]
+include = ["server.py", "serial_mcp_engine.py", "serial_mcp_client.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py"]
