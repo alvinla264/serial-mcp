@@ -44,6 +44,12 @@ Safety rules (enforced by both daemon and client helpers):
 - The daemon accepts a connection only if `SO_PEERCRED` reports the same uid.
 - The client helper checks the peer uid of the connected socket as well.
 - The socket path must fit `sun_path` (108 bytes); longer paths are refused.
+- The daemon's log file defaults to `/tmp/serial-mcp.log`; `SERIAL_MCP_DAEMON_LOG`
+  overrides it (tests use this). Note that importing `server` still creates the
+  legacy module-level session, which truncates the default log at import.
+- Any process running as the same user can connect and claim any role. The uid
+  check and the `0600`/`0700` modes are the only boundary, and they are the same
+  boundary that protects the legacy session files.
 
 ## 3. Start and stop
 
@@ -195,8 +201,8 @@ Rules:
 5. **Explicit acquire.** `lease acquire` grants a free lease, renews the
    caller's own lease, or returns `busy`. A `reacquire_required` client must
    use it. When the caller is re-granting after a loss or release, the result
-   includes `warning: "control was lost; device state may have changed since
-   you last used it"`.
+   includes `warning: "control was lost or released earlier; device state may
+   have changed since you last used it"`.
 6. **No silent resumption.** A `reacquire_required` client that calls a gated
    tool without first acquiring gets `lease_lost`. This happens even if the
    lease is currently free. A client becomes `reacquire_required` after it
@@ -270,6 +276,10 @@ device's transport immediately, in order per connection:
 Human clients count as live clients for daemon lifetime. A connected human keeps
 the daemon alive. Device output reaches a subscribed human client as `output`
 events regardless of AI reads.
+
+Security note: the `human` role is not a privilege separation between programs
+running as the same user. Any such process can connect and send `input`. Ungated
+raw input is the intended behaviour, not an access-control boundary.
 
 The raw session socket and companion pty (tio protocol) of a daemon-owned
 device remain available as before. Their bytes are not covered by lease

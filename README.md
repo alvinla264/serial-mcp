@@ -457,6 +457,31 @@ to serial logs or the I/O transcript. The user still grants the agent access to
 the named local file and target path/address; review paths, target capabilities,
 and memory ranges before invoking a transfer.
 
+## Shared daemon (protocol v1, daemon side)
+
+`serial-mcp-daemon` (`python -m serial_mcp_daemon`) is a per-user process that will
+let Pi and other coding agents share one serial device. It owns the single device
+connection, its reader and buffers, and runs the same tool implementations the MCP
+tools use. Clients talk to it over a permission-restricted UNIX socket
+(`$SERIAL_MCP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/serial-mcp`, else
+`/tmp/serial-mcp-<uid>`). The stdio launcher above is **unchanged** in this release
+and still runs its own in-process session.
+
+- Lifetime: the daemon stays up while any client connection is open. With no
+  clients it waits 30 seconds, drains in-flight work, releases the device and
+  exits. SIGTERM does the same.
+- Control: one control lease per device. The first gated tool call acquires it
+  automatically; another client gets `busy` with expiry information. The lease
+  expires after 60 idle seconds, and the former holder must acquire it again
+  explicitly. Read-only tools and output observation never renew it.
+- Human terminals: a `human` client forwards raw input without lease gating and
+  receives device output independently of AI reads. Human connections keep the
+  daemon alive. Input is deliberately unrestricted; see the contract.
+
+The complete frozen contract (frames, errors, lease rules, backpressure, limits)
+is in [docs/daemon-ipc.md](docs/daemon-ipc.md). Frontends should build on
+`serial_mcp_ipc` (`ensure_daemon`, `DaemonClient`), which is stdlib-only.
+
 ## Session protocol notes
 
 One owner, any number of clients. The owner holds the serial port; clients join
