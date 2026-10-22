@@ -285,12 +285,17 @@ class SerialState:
     transport-agnostic.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, log_path: str | None = None) -> None:
         self.transport: DirectTransport | SocketTransport | None = None
         self.default_timeout = 5.0
         self.default_idle_timeout = 0.2
         self.prompt_pattern: re.Pattern[bytes] | None = None
-        self.log_path = "/tmp/serial-mcp.log"
+        # SERIAL_MCP_LOG lets the shared daemon keep its own log: the module-level
+        # `state` below is created at import and opens this file for writing.
+        self.log_path = log_path or os.environ.get("SERIAL_MCP_LOG", "/tmp/serial-mcp.log")
+        # Callables receiving each device RX chunk (the shared daemon fans
+        # output out to its subscribers). They must not block.
+        self.rx_listeners: list = []
 
         self.reader_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
@@ -408,6 +413,11 @@ class SerialState:
                                 self._broadcast(chunk)
                                 with self.buffer_lock:
                                     self.buffer += chunk
+                                for listener in list(self.rx_listeners):
+                                    try:
+                                        listener(chunk)
+                                    except Exception as listener_exc:
+                                        self._log("ERR", f"RX listener failed: {listener_exc}")
                         else:
                             self._flush_rx_log_buffer(force=False)
                             time.sleep(0.01)
@@ -2315,6 +2325,23 @@ class SerialState:
         finally:
             self.io_lock.release()
 
+    def human_write(self, data: bytes) -> bool:
+        """Forward raw bytes typed by a human terminal to the device.
+
+        Deliberately ungated: it takes only the device write lock, which AI
+        operations hold for a single write, so it never waits behind a command
+        or transfer. Returns False when no transport is open.
+        """
+        transport = self.transport
+        if transport is None or not transport.is_open:
+            return False
+        with self.write_lock:
+            self._log("TX:HUMAN", data)
+            self._record_io("TX", "human", data)
+            transport.write(data)
+            transport.flush()
+        return True
+
     def _broadcast(self, payload: bytes) -> None:
         if not self.session_running.is_set() or not payload:
             return
@@ -2890,6 +2917,31 @@ class SerialState:
 state = SerialState()
 
 
+# Text returned by file_transfer_capabilities. Module-level so the shared daemon
+# can serve it without going through the FastMCP tool wrapper.
+FILE_TRANSFER_CAPABILITIES = (
+        "File transfer requires a serial connection. Direct-owned sessions announce "
+        "and gate their own socket/pty writers during transfer; queued user bytes are "
+        "discarded and counted. Attach mode is supported "
+        "only with confirm_shared_quiescence=true after all other tio clients agree "
+        "to stay idle; raw tio sockets have no arbitration mechanism. "
+        "Linux: requires a POSIX-like interactive shell, base64 -d, cat, and a "
+        "working sha256sum or openssl dgst -sha256; hash output and exit status "
+        "are probed. Transfers use shell-quoted paths and "
+        "temporary files. Upload verifies target byte count and SHA-256; download "
+        "verifies decoded byte count and target SHA-256. No-clobber Linux upload "
+        "uses same-directory ln, so hard links must be supported. U-Boot upload: "
+        "requires loady with YMODEM/CRC support, an explicit user-selected RAM "
+        "address, and a simple ASCII filename; uploaded RAM is read back with md.b "
+        "for exact comparison. U-Boot download: requires md.b, explicit address, "
+        "length, and an anchored prompt_regex; verifies sequential addresses and "
+        "byte count but has no end-to-end checksum. U-Boot md.b formatting must be "
+        "standard address-colon hex rows. Maximum file/range size is 8 MiB; timeout "
+        "is 1–1800 seconds. No default address, flash write, execution, reboot, or "
+        "persistent environment change is performed."
+)
+
+
 @mcp.tool()
 def connect(
     port: str | None = None,
@@ -2946,27 +2998,7 @@ def file_transfer_capabilities() -> str:
     confirmation that all other tio clients will remain idle; the raw tio socket
     has no lock/arbitration protocol, so this cannot be enforced remotely.
     """
-    return (
-        "File transfer requires a serial connection. Direct-owned sessions announce "
-        "and gate their own socket/pty writers during transfer; queued user bytes are "
-        "discarded and counted. Attach mode is supported "
-        "only with confirm_shared_quiescence=true after all other tio clients agree "
-        "to stay idle; raw tio sockets have no arbitration mechanism. "
-        "Linux: requires a POSIX-like interactive shell, base64 -d, cat, and a "
-        "working sha256sum or openssl dgst -sha256; hash output and exit status "
-        "are probed. Transfers use shell-quoted paths and "
-        "temporary files. Upload verifies target byte count and SHA-256; download "
-        "verifies decoded byte count and target SHA-256. No-clobber Linux upload "
-        "uses same-directory ln, so hard links must be supported. U-Boot upload: "
-        "requires loady with YMODEM/CRC support, an explicit user-selected RAM "
-        "address, and a simple ASCII filename; uploaded RAM is read back with md.b "
-        "for exact comparison. U-Boot download: requires md.b, explicit address, "
-        "length, and an anchored prompt_regex; verifies sequential addresses and "
-        "byte count but has no end-to-end checksum. U-Boot md.b formatting must be "
-        "standard address-colon hex rows. Maximum file/range size is 8 MiB; timeout "
-        "is 1–1800 seconds. No default address, flash write, execution, reboot, or "
-        "persistent environment change is performed."
-    )
+    return FILE_TRANSFER_CAPABILITIES
 
 
 @mcp.tool()
