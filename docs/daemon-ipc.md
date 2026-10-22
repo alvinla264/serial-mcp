@@ -44,9 +44,11 @@ Safety rules (enforced by both daemon and client helpers):
 - The daemon accepts a connection only if `SO_PEERCRED` reports the same uid.
 - The client helper checks the peer uid of the connected socket as well.
 - The socket path must fit `sun_path` (108 bytes); longer paths are refused.
-- The daemon's log file defaults to `/tmp/serial-mcp.log`; `SERIAL_MCP_DAEMON_LOG`
-  overrides it (tests use this). Note that importing `server` still creates the
-  legacy module-level session, which truncates the default log at import.
+- The daemon writes its own log to `<runtime dir>/daemon.log`; `SERIAL_MCP_DAEMON_LOG`
+  overrides the path (tests use this). The legacy launcher keeps `/tmp/serial-mcp.log`
+  (or `SERIAL_MCP_LOG` when set). A daemon sets `SERIAL_MCP_LOG` to its own log before
+  importing `server`, and it creates its state only after it holds the lock, so starting
+  a daemon never truncates the legacy log, and a daemon that loses the lock touches no log.
 - Any process running as the same user can connect and claim any role. The uid
   check and the `0600`/`0700` modes are the only boundary, and they are the same
   boundary that protects the legacy session files.

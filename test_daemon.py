@@ -779,3 +779,16 @@ def test_results_up_to_the_frame_limit_are_delivered_and_larger_ones_refused(har
     with pytest.raises(ipc.DaemonError) as err:
         c.call("read_output", {"timeout": 0})
     assert err.value.code == "result_too_large"
+
+
+def test_anonymous_connection_churn_does_not_postpone_grace(harness):
+    """A connection that never says hello is not a client and must not restart the grace clock."""
+    assert harness.daemon.status()["grace"]["active"] is True
+    harness.clock.advance(25)
+    anonymous = _raw_connect(harness)
+    _wait_until(lambda: len(harness.daemon._connections) == 1)
+    anonymous.close()
+    _wait_until(lambda: len(harness.daemon._connections) == 0)
+    harness.clock.advance(6)  # 31 s since the daemon began waiting with no clients
+    harness.daemon.tick()
+    assert harness.daemon.stopped, "anonymous churn must not restart the grace period"

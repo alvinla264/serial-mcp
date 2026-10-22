@@ -285,12 +285,14 @@ class SerialState:
     transport-agnostic.
     """
 
-    def __init__(self, log_path: str = "/tmp/serial-mcp.log") -> None:
+    def __init__(self, log_path: str | None = None) -> None:
         self.transport: DirectTransport | SocketTransport | None = None
         self.default_timeout = 5.0
         self.default_idle_timeout = 0.2
         self.prompt_pattern: re.Pattern[bytes] | None = None
-        self.log_path = log_path
+        # SERIAL_MCP_LOG lets the shared daemon keep its own log: the module-level
+        # `state` below is created at import and opens this file for writing.
+        self.log_path = log_path or os.environ.get("SERIAL_MCP_LOG", "/tmp/serial-mcp.log")
         # Callables receiving each device RX chunk (the shared daemon fans
         # output out to its subscribers). They must not block.
         self.rx_listeners: list = []

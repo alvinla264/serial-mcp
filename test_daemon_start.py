@@ -253,25 +253,37 @@ def test_two_independent_clients_share_one_daemon_and_one_device_owner(runtime, 
 
 
 def test_a_second_daemon_cannot_take_over_a_live_endpoint(runtime):
-    """Regression: a daemon started with an unlocked inherited descriptor must not replace the live one."""
+    """A second daemon started while the first holds daemon.lock must exit without touching the socket."""
     client = _ensure()
     try:
         client.hello(role="mcp", name="incumbent")
         before = os.stat(runtime / "daemon.sock").st_ino
-        probe_fd = os.open(runtime / "probe.lock", os.O_CREAT | os.O_RDWR, 0o600)  # never locked
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "serial_mcp_daemon", "--lock-fd", str(probe_fd)],
-            cwd=ROOT, env=dict(os.environ), pass_fds=(probe_fd,),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        proc = subprocess.run(
+            [sys.executable, "-m", "serial_mcp_daemon"], cwd=ROOT, env=dict(os.environ),
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=30,
         )
-        try:
-            proc.wait(timeout=10)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            os.close(probe_fd)
+        assert proc.returncode == 0, proc.stderr
         assert os.stat(runtime / "daemon.sock").st_ino == before, "the live socket was replaced"
         assert client.status()["protocol"] == 1, "the incumbent daemon stopped answering"
+        assert len(_daemon_pids_for(runtime)) == 1
+    finally:
+        client.close()
+        for pid in _daemon_pids_for(runtime):
+            os.kill(pid, signal.SIGTERM)
+        _wait_gone(_daemon_pids_for(runtime))
+
+
+def test_daemon_start_does_not_truncate_the_legacy_log(runtime, tmp_path, monkeypatch):
+    """Importing server must not wipe the legacy stdio launcher's log (/tmp/serial-mcp.log by default)."""
+    legacy_log = tmp_path / "legacy-serial-mcp.log"
+    legacy_log.write_text("legacy history line\n", encoding="utf-8")
+    monkeypatch.setenv("SERIAL_MCP_LOG", str(legacy_log))
+    monkeypatch.delenv("SERIAL_MCP_DAEMON_LOG", raising=False)  # exercise the default runtime log
+    client = _ensure()
+    try:
+        client.hello(role="mcp", name="log-check")
+        assert legacy_log.read_text(encoding="utf-8") == "legacy history line\n"
+        assert (runtime / "daemon.log").exists(), "the daemon writes its own log in its runtime directory"
     finally:
         client.close()
         for pid in _daemon_pids_for(runtime):

@@ -407,11 +407,11 @@ class DaemonServer:
         state=None,
         start_housekeeping: bool = True,
     ) -> None:
-        from server import SerialState  # heavy import: only the daemon needs it
-
         self.runtime = Path(runtime) if runtime is not None else ipc.runtime_dir()
         self.clock = clock
-        self.state = state if state is not None else SerialState()
+        # Created in start(), after the lock is held: importing ``server`` opens its
+        # log for writing, and a daemon that loses the lock must not touch it.
+        self.state = state
         self._start_housekeeping = start_housekeeping
         self._lock_fd: int | None = None
         self._lock = threading.RLock()
@@ -431,7 +431,6 @@ class DaemonServer:
         self._pending_release = False
         self._idle_since: float | None = None
         self._generation = 0
-        self.state.rx_listeners.append(self._on_device_rx)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -449,6 +448,10 @@ class DaemonServer:
         ipc.ensure_runtime_dir(self.runtime)
         self._acquire_lock()
         try:
+            if self.state is None:
+                from server import SerialState  # heavy import: only the daemon needs it
+                self.state = SerialState()
+            self.state.rx_listeners.append(self._on_device_rx)
             self._bind()
         except Exception:
             self._release_lock()
@@ -539,6 +542,8 @@ class DaemonServer:
         self._stopped.set()
 
     def _close_device(self) -> None:
+        if self.state is None:
+            return
         try:
             self.state.disconnect()
         except Exception as exc:
@@ -620,6 +625,10 @@ class DaemonServer:
     def unregister(self, conn: Connection) -> None:
         with self._lock:
             self._connections.discard(conn)
+            if conn not in self._clients:
+                # A connection that never completed hello is not a client: closing it
+                # must not touch the lease or restart the grace period.
+                return
             self._clients.discard(conn)
             if self._holder is conn:
                 if self._active == 0:
@@ -882,10 +891,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv)
 
     try:
-        from server import SerialState
-
-        log_path = os.environ.get("SERIAL_MCP_DAEMON_LOG", "/tmp/serial-mcp.log")
-        server = DaemonServer(start_housekeeping=True, state=SerialState(log_path=log_path))
+        # The daemon's log lives in its private runtime directory. Set before ``server``
+        # is imported, so the legacy module-level state never opens /tmp/serial-mcp.log.
+        os.environ["SERIAL_MCP_LOG"] = os.environ.get("SERIAL_MCP_DAEMON_LOG") or str(
+            ipc.runtime_dir() / "daemon.log")
+        server = DaemonServer(start_housekeeping=True)
         server.start()
     except DaemonAlreadyRunning:
         return 0
