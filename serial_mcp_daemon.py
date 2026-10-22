@@ -43,6 +43,7 @@ from serial_mcp_ipc import (
     HELLO_TIMEOUT_SECONDS,
     LEASE_IDLE_SECONDS,
     MAX_HUMAN_INPUT_BYTES,
+    LOCK_PROBE_WAIT_SECONDS,
     MAX_INFLIGHT_CALLS_PER_CONNECTION,
     MAX_OUTPUT_EVENT_BYTES,
     MAX_SUBSCRIBER_QUEUE_BYTES,
@@ -54,7 +55,6 @@ from serial_mcp_ipc import (
 )
 
 DAEMON_VERSION = "0.2.0"
-MAX_RESULT_BYTES = ipc.MAX_FRAME_BYTES // 2  # leave room for the JSON envelope
 MAX_CLIENT_NAME = 64
 ROLES = ("mcp", "human")
 
@@ -394,9 +394,9 @@ class Connection:
 class DaemonServer:
     """Owns the device, the client connections, the lease, and the lifetime.
 
-    ``runtime`` is the private runtime directory. ``lock_fd`` may be an already
-    locked descriptor inherited from the starter; otherwise the daemon takes the
-    lock itself and refuses to run if another daemon holds it.
+    ``runtime`` is the private runtime directory. The daemon always takes the
+    exclusive ``daemon.lock`` itself and never serves or touches the socket without
+    it; if another daemon keeps the lock past ``LOCK_PROBE_WAIT_SECONDS`` it refuses to run.
     """
 
     def __init__(
@@ -406,7 +406,6 @@ class DaemonServer:
         clock=time.monotonic,
         state=None,
         start_housekeeping: bool = True,
-        lock_fd: int | None = None,
     ) -> None:
         from server import SerialState  # heavy import: only the daemon needs it
 
@@ -414,8 +413,7 @@ class DaemonServer:
         self.clock = clock
         self.state = state if state is not None else SerialState()
         self._start_housekeeping = start_housekeeping
-        self._lock_fd = lock_fd
-        self._owns_lock_fd = False
+        self._lock_fd: int | None = None
         self._lock = threading.RLock()
         self._drained = threading.Condition(self._lock)
         self._listener: socket.socket | None = None
@@ -463,27 +461,27 @@ class DaemonServer:
         self.log("SYS", f"daemon listening on {self.socket_path}")
 
     def _acquire_lock(self) -> None:
-        if self._lock_fd is not None:
-            # Inherited from the starter; it already holds the exclusive lock.
-            return
         path = self.runtime / "daemon.lock"
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            raise DaemonAlreadyRunning(f"another daemon holds {path}") from None
+        deadline = time.monotonic() + LOCK_PROBE_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise DaemonAlreadyRunning(f"another daemon holds {path}") from None
+                time.sleep(0.02)
         self._lock_fd = fd
-        self._owns_lock_fd = True
 
     def _release_lock(self) -> None:
-        if self._lock_fd is not None and self._owns_lock_fd:
+        if self._lock_fd is not None:
             try:
-                os.close(self._lock_fd)
+                os.close(self._lock_fd)  # closing releases the flock
             except OSError:
                 pass
         self._lock_fd = None
-        self._owns_lock_fd = False
 
     def _bind(self) -> None:
         path = self.socket_path
@@ -843,8 +841,11 @@ class DaemonServer:
             if gated:
                 self._end_gated(conn)
         text = text if isinstance(text, str) else str(text)
-        if len(text.encode("utf-8")) > MAX_RESULT_BYTES:
-            conn.send_error(rid, "result_too_large", "result exceeds 4 MiB; use max_lines or view_io")
+        try:
+            encode_frame({"id": rid, "ok": True, "result": {"result": text}})
+        except ProtocolError:
+            conn.send_error(rid, "result_too_large",
+                            "the result does not fit a 4 MiB frame; use max_lines or view_io")
             return
         conn.send_result(rid, {"result": text})
         if tool in DEVICE_CHANGING_TOOLS:
@@ -878,16 +879,13 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(prog="serial-mcp-daemon", description=__doc__.splitlines()[0])
-    parser.add_argument("--lock-fd", type=int, default=None,
-                        help="inherited descriptor already holding the daemon lock (set by the starter)")
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
     try:
         from server import SerialState
 
         log_path = os.environ.get("SERIAL_MCP_DAEMON_LOG", "/tmp/serial-mcp.log")
-        server = DaemonServer(lock_fd=args.lock_fd, start_housekeeping=True,
-                              state=SerialState(log_path=log_path))
+        server = DaemonServer(start_housekeeping=True, state=SerialState(log_path=log_path))
         server.start()
     except DaemonAlreadyRunning:
         return 0

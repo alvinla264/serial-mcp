@@ -34,7 +34,7 @@ Endpoint files inside it:
 | File | Purpose |
 |---|---|
 | `daemon.sock` | UNIX stream socket, mode `0600` |
-| `daemon.lock` | `flock` file held for the whole daemon lifetime; never deleted |
+| `daemon.lock` | `flock` file. The daemon takes it exclusively itself and holds it for its whole lifetime; never deleted |
 
 Safety rules (enforced by both daemon and client helpers):
 
@@ -53,24 +53,29 @@ Safety rules (enforced by both daemon and client helpers):
 
 ## 3. Start and stop
 
-`ensure_daemon()` (client helper) is race-safe and bounded:
+Safety rests on the daemon, not on the starter. The daemon takes `daemon.lock`
+exclusively on its own descriptor before it touches the socket. It waits at most
+`LOCK_PROBE_WAIT_SECONDS` (0.5 s) for the lock and otherwise exits 0 without
+binding or unlinking anything. A daemon that does not hold the lock therefore
+never serves, never replaces a socket, and cannot take over a live endpoint, no
+matter how it was started. The daemon accepts no inherited lock descriptor.
+
+`ensure_daemon()` (client helper) decides only when to spawn, and is bounded:
 
 1. Try to connect to `daemon.sock`. On success, use it.
-2. Otherwise attempt a non-blocking exclusive `flock` on `daemon.lock`.
-   - Lock held by someone else: a daemon is starting or running. Poll
-     connect for the remaining start budget (short intervals, bounded).
-   - Lock acquired: no live daemon exists. Remove any stale `daemon.sock`,
-     then spawn `python -m serial_mcp_daemon --lock-fd N` with the locked
-     descriptor inherited (`pass_fds`), `start_new_session=True`, stdio on
-     `DEVNULL`, and the runtime directory passed through. The starter closes
-     its copy after spawning, so the lock is never released in between.
-3. Repeat until connected or `START_TIMEOUT_SECONDS` (10 s) elapse. At most
-   3 spawn attempts are made. Timeout raises `DaemonUnavailable`; nothing is
-   left running that the caller cannot reach.
+2. If a spawn happened less than `START_GRACE_SECONDS` (2 s) ago, poll: the child
+   is still taking the lock and binding.
+3. Probe `daemon.lock` with a non-blocking exclusive `flock` and release it at
+   once. If the lock is held, a daemon is starting or running: poll. If it is
+   free, spawn `python -m serial_mcp_daemon` (stdio on `DEVNULL`,
+   `start_new_session=True`, runtime directory passed through). Racing starters
+   may each spawn; the losers exit on their own after their lock probe times out.
+4. Repeat until connected or `START_TIMEOUT_SECONDS` (10 s) elapse. At most 3
+   spawns are made. Timeout raises `DaemonUnavailable`.
 
-The daemon refuses to run without the inherited lock (exits 0 quietly when the
-lock is not actually held). Therefore at most one daemon listens per runtime
-directory, regardless of how many clients start concurrently.
+Starters never remove a socket file. Only a daemon that holds the lock unlinks a
+stale socket. Any client, in any language, may follow the same steps, and the
+daemon still enforces the single-instance rule.
 
 Lifetime (daemon side):
 
@@ -154,8 +159,9 @@ Errors: an unknown tool returns `unknown_tool`; gated calls can also return
 example `Error: Not connected to a serial port.`) is still a successful
 `call` whose `result` is that text, exactly as the MCP tool behaves.
 
-A result larger than 4 MiB is refused with `result_too_large`; use `max_lines`
-or `view_io` instead.
+A result is delivered only if its response frame fits `MAX_FRAME_BYTES` (4 MiB)
+after JSON encoding; a larger result is refused with `result_too_large`. Use
+`max_lines` or `view_io` instead.
 
 ## 6. Control lease
 
@@ -302,7 +308,7 @@ arbitration. Do not describe them as protected.
 | `lease_lost` | the caller must explicitly reacquire (section 6) |
 | `not_connected` | `input` with no device connected |
 | `too_large` | `input` data over 64 KiB |
-| `result_too_large` | a tool result over 4 MiB |
+| `result_too_large` | the result does not fit one 4 MiB response frame after JSON encoding |
 | `overloaded` | too many concurrent calls on this connection |
 | `shutting_down` | the daemon is draining and rejects new work |
 | `internal` | unexpected daemon error; details are logged, not sent |
@@ -317,6 +323,8 @@ arbitration. Do not describe them as protected.
 | `GRACE_SECONDS` | 30 |
 | `DRAIN_TIMEOUT_SECONDS` | 5 |
 | `START_TIMEOUT_SECONDS` | 10 |
+| `START_GRACE_SECONDS` | 2 |
+| `LOCK_PROBE_WAIT_SECONDS` | 0.5 |
 | `SLOW_CONSUMER_TIMEOUT_SECONDS` | 5 |
 | `MAX_SUBSCRIBER_QUEUE_BYTES` | 256 KiB |
 | `MAX_OUTPUT_EVENT_BYTES` | 16 KiB |
@@ -325,7 +333,7 @@ arbitration. Do not describe them as protected.
 
 ## 12. Synthetic-client conformance
 
-The repository test suite (`test_daemon.py`) drives the daemon with synthetic
+The repository test suite (`test_daemon.py`, `test_daemon_start.py`, `test_ipc.py`) drives the daemon with synthetic
 clients over the real socket, using fake devices (ptys). It covers: concurrent
 auto-start, socket and directory permissions, stale socket recovery, hello
 handling, unsupported versions, frame limits, tool dispatch and argument

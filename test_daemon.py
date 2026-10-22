@@ -768,3 +768,14 @@ def test_device_event_reaches_every_client_on_connect_and_disconnect(harness):
     finally:
         harness.state.disconnect()
         _release_device(master, slave, stop, thread)
+
+
+def test_results_up_to_the_frame_limit_are_delivered_and_larger_ones_refused(harness):
+    c = harness.client()
+    harness.state.buffer = b"a" * (3 * 1024 * 1024 + 512 * 1024)  # 3.5 MiB: fits one 4 MiB frame
+    assert len(c.call("read_output", {"timeout": 0})) == 3 * 1024 * 1024 + 512 * 1024
+
+    harness.state.buffer = b"a" * (5 * 1024 * 1024)  # 5 MiB: cannot be framed
+    with pytest.raises(ipc.DaemonError) as err:
+        c.call("read_output", {"timeout": 0})
+    assert err.value.code == "result_too_large"

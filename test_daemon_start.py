@@ -51,6 +51,15 @@ def _is_running(pid: int) -> bool:
     return state != b"Z"
 
 
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("condition not reached within the bounded wait")
+
+
 def _wait_gone(pids, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -97,8 +106,10 @@ def test_simultaneous_first_clients_start_exactly_one_daemon(runtime):
     try:
         for index, client in enumerate(clients):
             client.hello(role="mcp", name=f"racer-{index}")
-        assert all(c.status()["clients"] == 8 for c in clients[:1])
-        assert len(_daemon_pids_for(runtime)) == 1, "concurrent starters must produce one daemon"
+        # Every client reached the same daemon, and losing starters that briefly
+        # spawned exit on their own once the lock probe times out.
+        assert all(c.status()["clients"] == 8 for c in clients)
+        _wait_until(lambda: len(_daemon_pids_for(runtime)) == 1, timeout=10)
     finally:
         for client in clients:
             client.close()
@@ -236,6 +247,33 @@ def test_two_independent_clients_share_one_daemon_and_one_device_owner(runtime, 
         worker.join(timeout=2)
         second.close()
         os.close(master)
+        for pid in _daemon_pids_for(runtime):
+            os.kill(pid, signal.SIGTERM)
+        _wait_gone(_daemon_pids_for(runtime))
+
+
+def test_a_second_daemon_cannot_take_over_a_live_endpoint(runtime):
+    """Regression: a daemon started with an unlocked inherited descriptor must not replace the live one."""
+    client = _ensure()
+    try:
+        client.hello(role="mcp", name="incumbent")
+        before = os.stat(runtime / "daemon.sock").st_ino
+        probe_fd = os.open(runtime / "probe.lock", os.O_CREAT | os.O_RDWR, 0o600)  # never locked
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "serial_mcp_daemon", "--lock-fd", str(probe_fd)],
+            cwd=ROOT, env=dict(os.environ), pass_fds=(probe_fd,),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            os.close(probe_fd)
+        assert os.stat(runtime / "daemon.sock").st_ino == before, "the live socket was replaced"
+        assert client.status()["protocol"] == 1, "the incumbent daemon stopped answering"
+    finally:
+        client.close()
         for pid in _daemon_pids_for(runtime):
             os.kill(pid, signal.SIGTERM)
         _wait_gone(_daemon_pids_for(runtime))

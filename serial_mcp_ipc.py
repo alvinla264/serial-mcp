@@ -38,6 +38,8 @@ MAX_OUTPUT_EVENT_BYTES = 16 * 1024
 MAX_INFLIGHT_CALLS_PER_CONNECTION = 8
 MAX_HUMAN_INPUT_BYTES = 64 * 1024
 MAX_SPAWN_ATTEMPTS = 3
+LOCK_PROBE_WAIT_SECONDS = 0.5  # how long a daemon waits for daemon.lock (starter probes hold it for microseconds)
+START_GRACE_SECONDS = 2.0      # after a spawn, how long a starter waits for the child to take the lock
 
 # AF_UNIX sun_path is 108 bytes including the terminating NUL on Linux.
 SUN_PATH_MAX = 107
@@ -366,19 +368,20 @@ def ensure_daemon(
 ) -> DaemonClient:
     """Connect to the per-user daemon, starting it if absent. Bounded and race-safe.
 
-    Concurrent callers converge on one daemon: whoever holds the exclusive lock
-    on ``daemon.lock`` is the only process allowed to spawn, and it passes the
-    still-locked descriptor to the child, so the lock is never released between
-    the decision to start and the daemon taking ownership. Callers that do not
-    get the lock poll for the daemon to become connectable until ``timeout``.
+    Safety does not rest on this helper: the daemon itself takes the exclusive
+    ``daemon.lock`` and refuses to serve or to touch the socket without it, so
+    any number of starters, in any language, converge on one daemon. This helper
+    only decides *when to spawn*: it spawns when the lock looks free, and polls
+    for connectability otherwise, within ``timeout``. At most
+    ``MAX_SPAWN_ATTEMPTS`` spawns are made.
 
-    ``daemon_argv`` overrides the spawn command (tests); the lock descriptor is
-    appended as ``--lock-fd N``.
+    ``daemon_argv`` overrides the spawn command (tests).
     """
     directory = ensure_runtime_dir()
     path = directory / "daemon.sock"
     deadline = time.monotonic() + timeout
     spawns = 0
+    last_spawn: float | None = None
     while True:
         remaining = deadline - time.monotonic()
         try:
@@ -387,46 +390,34 @@ def ensure_daemon(
             pass
         if time.monotonic() >= deadline:
             raise DaemonUnavailable(f"the daemon did not become ready within {timeout}s")
-
-        fd = os.open(directory / "daemon.lock", os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            # Someone else holds the lock: a daemon is starting or running. Poll.
-            os.close(fd)
+        in_cooldown = last_spawn is not None and time.monotonic() - last_spawn < START_GRACE_SECONDS
+        if in_cooldown or not _lock_is_free(directory):
+            # Our child (or another daemon) is still taking the lock and binding: poll.
             time.sleep(0.05)
             continue
-
-        # We hold the lock, so no live daemon owns the socket: any file there is stale.
-        try:
-            if spawns >= MAX_SPAWN_ATTEMPTS:
-                raise DaemonUnavailable("the daemon failed to start after several attempts")
-            _remove_stale_socket(path)
-            _spawn_daemon(fd, directory, daemon_argv)
-            spawns += 1
-        except BaseException:
-            os.close(fd)
-            raise
-        # The child now holds the lock through the inherited descriptor.
-        os.close(fd)
+        if spawns >= MAX_SPAWN_ATTEMPTS:
+            raise DaemonUnavailable("the daemon failed to start after several attempts")
+        _spawn_daemon(directory, daemon_argv)
+        spawns += 1
+        last_spawn = time.monotonic()
 
 
-def _remove_stale_socket(path: Path) -> None:
+def _lock_is_free(directory: Path) -> bool:
+    """Probe the daemon lock without keeping it. A racing daemon wins regardless."""
+    fd = os.open(directory / "daemon.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISSOCK(st.st_mode):
-        raise UnsafeRuntimeDir(f"{path} exists and is not a socket; refusing to replace it")
-    os.unlink(path)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)  # closing releases the probe lock
+    return True
 
 
-def _spawn_daemon(lock_fd: int, directory: Path, daemon_argv: list[str] | None) -> None:
+def _spawn_daemon(directory: Path, daemon_argv: list[str] | None) -> None:
     argv = list(daemon_argv) if daemon_argv else [sys.executable, "-m", "serial_mcp_daemon"]
-    argv += ["--lock-fd", str(lock_fd)]
     env = dict(os.environ)
     env["SERIAL_MCP_RUNTIME_DIR"] = str(directory)
-    devnull = subprocess.DEVNULL
     # Reap daemons this process spawned earlier that have since exited, so a
     # long-running client does not accumulate zombie children.
     _SPAWNED[:] = [child for child in _SPAWNED if child.poll() is None]
@@ -434,10 +425,9 @@ def _spawn_daemon(lock_fd: int, directory: Path, daemon_argv: list[str] | None) 
         argv,
         cwd=_PACKAGE_DIR,
         env=env,
-        stdin=devnull,
-        stdout=devnull,
-        stderr=devnull,
-        pass_fds=(lock_fd,),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
     ))
