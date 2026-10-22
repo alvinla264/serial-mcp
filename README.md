@@ -482,6 +482,14 @@ The complete frozen contract (frames, errors, lease rules, backpressure, limits)
 is in [docs/daemon-ipc.md](docs/daemon-ipc.md). Frontends should build on
 `serial_mcp_ipc` (`ensure_daemon`, `DaemonClient`), which is stdlib-only.
 
+## Human terminal
+
+`serial-mcp-terminal` is an interactive console for you. It shows the device's live
+output and sends your keys straight to it, while MCP agents stay connected. Ctrl-]
+exits, locally and without sending it to the device. It holds no AI lease and it never
+opens the port. Install, usage, daemon lifetime effects, connect/disconnect semantics
+and the concurrent-input risk are in [docs/human-terminal.md](docs/human-terminal.md).
+
 ## Session protocol notes
 
 One owner, any number of clients. The owner holds the serial port; clients join

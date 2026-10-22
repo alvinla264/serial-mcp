@@ -29,6 +29,8 @@ to every party.
 | `serial_mcp_daemon.py` | The shared per-user daemon: device ownership, control lease, client lifetime, tool dispatch, output fan-out, human input. |
 | `docs/daemon-ipc.md` | Frozen daemon IPC contract (protocol v1). Change it before changing the wire behaviour. |
 | `test_ipc.py`, `test_daemon.py`, `test_daemon_start.py` | Daemon and IPC tests: synthetic clients, fake ptys, real daemon subprocesses in private runtime directories. |
+| `serial_mcp_terminal.py` | The native human terminal (`serial-mcp-terminal`): a human client of the daemon. Stdlib-only; never opens the port. See `docs/human-terminal.md`. |
+| `test_terminal.py` | Human terminal tests: the real terminal on a pty against the real daemon, with synthetic AI peers and fake devices. |
 | `test_server.py` | Pytest suite. Uses fake ptys / fake sockets — never a real device. |
 | `README.md` | User-facing documentation: install, agent configs, tool reference, protocol notes. |
 | `pyproject.toml` | Packaging + `serial-mcp` and `serial-mcp-daemon` console entry points (enables `uvx --from git+...`). |
