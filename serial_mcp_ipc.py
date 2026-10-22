@@ -213,6 +213,7 @@ class DaemonClient:
         self._events: "queue.Queue[dict]" = queue.Queue()
         self._next_id = 0
         self._closed = False
+        self._close_reason: str | None = None
         self.client_id: str | None = None
         self._thread = threading.Thread(target=self._read_loop, name="daemon-client-reader", daemon=True)
         self._thread.start()
@@ -265,7 +266,8 @@ class DaemonClient:
             raise TimeoutError(f"no reply to {op!r} within {timeout}s")
         reply = slot.reply
         if reply is None:
-            raise DaemonUnavailable("connection to the daemon closed before a reply")
+            reason = self._close_reason or "connection to the daemon closed before a reply"
+            raise DaemonUnavailable(reason)
         if not reply.get("ok"):
             error = reply.get("error") or {}
             raise DaemonError(error.get("code", "internal"), error.get("message", ""), error)
@@ -326,7 +328,11 @@ class DaemonClient:
                 if slot is not None:
                     slot.reply = frame
                     slot.event.set()
-        except (ProtocolError, OSError):
+        except ProtocolError as exc:
+            # The peer spoke something this client cannot parse (for example another
+            # protocol version). Keep the reason for the waiting request.
+            self._close_reason = f"the daemon sent an unsupported frame ({exc.code}: {exc.message})"
+        except OSError:
             pass
         finally:
             with self._waiters_lock:
