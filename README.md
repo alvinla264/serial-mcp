@@ -10,7 +10,9 @@ holds the port and the other joins its session over a raw-byte UNIX socket:
   agent attaches to your session (`attach`). It cannot lock you out, and several
   agent sessions can share the one device.
 - **The agent owns it** — it calls `connect(port=...)` and serves a session socket
-  plus a companion pty for your terminal tools to attach to.
+  plus a companion pty for your terminal tools to attach to. With the shared daemon
+  the port is held by the daemon for all agents, not by one agent process; see
+  [docs/mcp-frontend.md](docs/mcp-frontend.md).
 
 Repo: https://github.com/alvinla264/serial-mcp
 
@@ -21,7 +23,7 @@ There are three ways to run it, no local checkout required for any of them:
 | Source | Command |
 |---|---|
 | **GitHub (recommended)** | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
-| **Local checkout + uv** | `uv run --with fastmcp,pyserial /path/to/serial-mcp/server.py` |
+| **Local checkout + uv** | `uv run --with fastmcp,pyserial /path/to/serial-mcp/serial_mcp_client.py` |
 | **Local checkout + nix** | `nix run github:alvinla264/serial-mcp` — or `nix run /path/to/serial-mcp` |
 
 Notes:
@@ -29,7 +31,10 @@ Notes:
 - The GitHub/uvx and nix forms fetch, build, and run straight from the repo —
   nothing to clone or install first.
 - Plain pip works too: `pip install fastmcp pyserial`, then
-  `python3 server.py` from a checkout.
+  `python3 serial_mcp_client.py` from a checkout.
+- `serial-mcp` is the stdio frontend of the shared daemon (see
+  [Shared daemon](#shared-daemon-protocol-v1)). The previous in-process server is
+  `serial-mcp-legacy` (`server.py`). Migration and setup: [docs/mcp-frontend.md](docs/mcp-frontend.md).
 - Tests: `nix develop -c python -m pytest test_server.py`, or
   `uv run --with fastmcp,pyserial,pytest python -m pytest test_server.py`.
 - Serial permissions still apply outside nix: your user needs `dialout` group
@@ -457,15 +462,20 @@ to serial logs or the I/O transcript. The user still grants the agent access to
 the named local file and target path/address; review paths, target capabilities,
 and memory ranges before invoking a transfer.
 
-## Shared daemon (protocol v1, daemon side)
+## Shared daemon (protocol v1)
 
-`serial-mcp-daemon` (`python -m serial_mcp_daemon`) is a per-user process that will
-let Pi and other coding agents share one serial device. It owns the single device
+`serial-mcp-daemon` (`python -m serial_mcp_daemon`) is a per-user process that lets
+Pi and other coding agents share one serial device. It owns the single device
 connection, its reader and buffers, and runs the same tool implementations the MCP
 tools use. Clients talk to it over a permission-restricted UNIX socket
 (`$SERIAL_MCP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/serial-mcp`, else
-`/tmp/serial-mcp-<uid>`). The stdio launcher above is **unchanged** in this release
-and still runs its own in-process session.
+`/tmp/serial-mcp-<uid>`).
+
+`serial-mcp` (the stdio launcher above) is a thin frontend of this daemon: each agent
+instance starts one, and it discovers or starts the daemon. Its tools match the
+legacy server, and it adds `lease_acquire`, `lease_release` and `lease_status` for
+explicit AI control. Setup, agent configuration, migration from the old launcher,
+lifecycle and error behaviour are in [docs/mcp-frontend.md](docs/mcp-frontend.md).
 
 - Lifetime: the daemon stays up while any client connection is open. With no
   clients it waits 30 seconds, drains in-flight work, releases the device and
@@ -473,7 +483,8 @@ and still runs its own in-process session.
 - Control: one control lease per device. The first gated tool call acquires it
   automatically; another client gets `busy` with expiry information. The lease
   expires after 60 idle seconds, and the former holder must acquire it again
-  explicitly. Read-only tools and output observation never renew it.
+  explicitly (with a warning that device state may have changed). Read-only tools and
+  output observation never renew it.
 - Human terminals: a `human` client forwards raw input without lease gating and
   receives device output independently of AI reads. Human connections keep the
   daemon alive. Input is deliberately unrestricted; see the contract.

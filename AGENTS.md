@@ -27,8 +27,10 @@ to every party.
 | `server.py` | The legacy stdio MCP server: MCP tools, serial handling, session sockets, bootloader entry logic. Its tool wrappers delegate to `SerialState`. |
 | `serial_mcp_ipc.py` | Stdlib-only daemon IPC primitives: framing, private runtime directory, race-safe `ensure_daemon`, `DaemonClient`. Must not import `server`. |
 | `serial_mcp_daemon.py` | The shared per-user daemon: device ownership, control lease, client lifetime, tool dispatch, output fan-out, human input. |
+| `serial_mcp_client.py` | The stdio MCP frontend (`serial-mcp`): a thin client of the daemon that mirrors the legacy tools. Holds no serial state. See `docs/mcp-frontend.md`. |
 | `docs/daemon-ipc.md` | Frozen daemon IPC contract (protocol v1). Change it before changing the wire behaviour. |
 | `test_ipc.py`, `test_daemon.py`, `test_daemon_start.py` | Daemon and IPC tests: synthetic clients, fake ptys, real daemon subprocesses in private runtime directories. |
+| `test_mcp_client.py` | MCP frontend tests: real frontend subprocesses over MCP stdio, tool-list parity with `server.py`, lease and lifetime behaviour, scripted fake daemons. |
 | `test_server.py` | Pytest suite. Uses fake ptys / fake sockets — never a real device. |
 | `README.md` | User-facing documentation: install, agent configs, tool reference, protocol notes. |
 | `pyproject.toml` | Packaging + `serial-mcp` and `serial-mcp-daemon` console entry points (enables `uvx --from git+...`). |
