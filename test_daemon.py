@@ -20,7 +20,7 @@ import pytest
 import serial_mcp_ipc as ipc
 import serial_mcp_daemon as daemon_mod
 from serial_mcp_daemon import DaemonServer
-from server import SerialState
+from serial_mcp_engine import SerialState
 
 
 class FakeClock:

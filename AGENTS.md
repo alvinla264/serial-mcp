@@ -24,7 +24,8 @@ to every party.
 
 | Path | Purpose |
 |---|---|
-| `server.py` | The legacy stdio MCP server: MCP tools, serial handling, session sockets, bootloader entry logic. Its tool wrappers delegate to `SerialState`. |
+| `server.py` | The legacy stdio MCP server (`serial-mcp-legacy`): a FastMCP adapter that registers the MCP tools and keeps one in-process `SerialState`. It has no serial logic of its own. The shared daemon must never import it. |
+| `serial_mcp_engine.py` | The device-agnostic serial engine: transports, `SerialState`, session sockets, transfers, login and bootloader machinery, `FILE_TRANSFER_CAPABILITIES`. No MCP or FastMCP import, and no state, log, device or thread at import time. Constructed deliberately by its owner (the daemon in `start()`, or `server.py`). |
 | `serial_mcp_ipc.py` | Stdlib-only daemon IPC primitives: framing, private runtime directory, race-safe `ensure_daemon`, `DaemonClient`. Must not import `server`. |
 | `serial_mcp_daemon.py` | The shared per-user daemon: device ownership, control lease, client lifetime, tool dispatch, output fan-out, human input. |
 | `serial_mcp_client.py` | The stdio MCP frontend (`serial-mcp`): a thin client of the daemon that mirrors the legacy tools. Holds no serial state. See `docs/mcp-frontend.md`. |
@@ -33,6 +34,7 @@ to every party.
 | `test_mcp_client.py` | MCP frontend tests: real frontend subprocesses over MCP stdio, tool-list parity with `server.py`, lease and lifetime behaviour, scripted fake daemons. |
 | `serial_mcp_terminal.py` | The native human terminal (`serial-mcp-terminal`): a human client of the daemon. Stdlib-only; never opens the port. See `docs/human-terminal.md`. |
 | `test_terminal.py` | Human terminal tests: the real terminal on a pty against the real daemon, with synthetic AI peers and fake devices. |
+| `test_engine_isolation.py` | Import and startup invariants in fresh subprocesses: the engine and daemon import with no side effects, the daemon serves IPC with `fastmcp`, `mcp` and `server` blocked, and exactly one engine is constructed. |
 | `test_server.py` | Pytest suite. Uses fake ptys / fake sockets — never a real device. |
 | `README.md` | User-facing documentation: install, agent configs, tool reference, protocol notes. |
 | `pyproject.toml` | Packaging + `serial-mcp` and `serial-mcp-daemon` console entry points (enables `uvx --from git+...`). |
