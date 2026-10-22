@@ -145,3 +145,30 @@ def test_socket_path_length_is_checked(monkeypatch, tmp_path):
     monkeypatch.setenv("SERIAL_MCP_RUNTIME_DIR", str(long_dir))
     with pytest.raises(ipc.UnsafeRuntimeDir):
         ipc.socket_path()
+
+
+def test_client_names_an_unsupported_daemon_protocol_instead_of_a_silent_close():
+    """A peer that answers in another protocol version must produce a clear error.
+
+    The reader cannot parse the reply, so it closes the connection. The caller
+    must see why (the version), not a generic "closed before a reply".
+    """
+    import threading
+
+    a, b = _pair()
+    b.settimeout(5)
+    client = ipc.DaemonClient(a)
+
+    def fake_daemon():
+        b.recv(65536)  # the request line
+        b.sendall(b'{"v":2,"id":1,"ok":true,"result":{}}\n')
+
+    thread = threading.Thread(target=fake_daemon, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(ipc.DaemonUnavailable, match="protocol version 2"):
+            client.request("status", timeout=5)
+    finally:
+        thread.join(5)
+        client.close()
+        b.close()
