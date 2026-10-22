@@ -8,12 +8,16 @@ contract that this module implements.
 
 from __future__ import annotations
 
-import errno
+import base64
+import fcntl
 import json
 import os
+import queue
 import socket
 import stat
 import struct
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -36,7 +40,7 @@ MAX_HUMAN_INPUT_BYTES = 64 * 1024
 MAX_SPAWN_ATTEMPTS = 3
 
 # AF_UNIX sun_path is 108 bytes including the terminating NUL on Linux.
-_SUN_PATH_MAX = 107
+SUN_PATH_MAX = 107
 
 
 class ProtocolError(Exception):
@@ -144,25 +148,25 @@ def runtime_dir() -> Path:
     return Path(f"/tmp/serial-mcp-{os.getuid()}")
 
 
-def socket_path() -> Path:
-    path = runtime_dir() / "daemon.sock"
-    if len(os.fsencode(str(path))) > _SUN_PATH_MAX:
+def socket_path(directory: Path | None = None) -> Path:
+    path = (directory if directory is not None else runtime_dir()) / "daemon.sock"
+    if len(os.fsencode(str(path))) > SUN_PATH_MAX:
         raise UnsafeRuntimeDir(f"socket path is too long for AF_UNIX: {path}")
     return path
 
 
-def lock_path() -> Path:
-    return runtime_dir() / "daemon.lock"
+def lock_path(directory: Path | None = None) -> Path:
+    return (directory if directory is not None else runtime_dir()) / "daemon.lock"
 
 
-def ensure_runtime_dir() -> Path:
+def ensure_runtime_dir(directory: Path | None = None) -> Path:
     """Create the runtime directory privately, or verify an existing one.
 
     An existing directory is never repaired: a directory that others can read or
     write, that is a symlink, or that another user owns is refused, because
     accepting it would let someone else stand in for the daemon.
     """
-    path = runtime_dir()
+    path = directory if directory is not None else runtime_dir()
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:
@@ -184,3 +188,256 @@ def _verify_private_dir(path: Path) -> None:
         raise UnsafeRuntimeDir(f"runtime directory {path} is owned by another user")
     if st.st_mode & 0o077:
         raise UnsafeRuntimeDir(f"runtime directory {path} is accessible to other users (mode {stat.S_IMODE(st.st_mode):o})")
+
+
+# ---- client connection -----------------------------------------------------
+
+
+class DaemonClient:
+    """A connected, hello'd daemon session with request/response correlation.
+
+    A background thread reads every incoming frame: responses wake the waiting
+    request by ``id``, events are queued for ``next_event``. Requests may be
+    issued from several threads concurrently, so a slow gated call never blocks
+    a human input frame or a status query on the same connection.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._reader = FrameReader(sock)
+        self._send_lock = threading.Lock()
+        self._waiters: dict = {}
+        self._waiters_lock = threading.Lock()
+        self._events: "queue.Queue[dict]" = queue.Queue()
+        self._next_id = 0
+        self._closed = False
+        self.client_id: str | None = None
+        self._thread = threading.Thread(target=self._read_loop, name="daemon-client-reader", daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def connect(cls, path=None, timeout: float = START_TIMEOUT_SECONDS) -> "DaemonClient":
+        """Connect to an already-running daemon. Does not start one."""
+        target = str(path) if path is not None else str(socket_path())
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(target)
+        except OSError as exc:
+            sock.close()
+            raise DaemonUnavailable(f"no daemon at {target}: {exc.strerror or exc}") from None
+        _verify_peer_uid(sock)
+        sock.settimeout(None)
+        return cls(sock)
+
+    def hello(self, role: str, name: str, pid: int | None = None, client_version: str | None = None,
+              timeout: float = 10.0) -> dict:
+        fields = {"role": role, "name": name}
+        if pid is not None:
+            fields["pid"] = pid
+        if client_version is not None:
+            fields["client_version"] = client_version
+        result = self.request("hello", timeout=timeout, **fields)
+        self.client_id = result.get("client_id")
+        return result
+
+    def request(self, op: str, timeout: float = 60.0, **fields) -> dict:
+        """Send one request and return its ``result``; raise DaemonError on failure."""
+        with self._waiters_lock:
+            if self._closed:
+                raise DaemonUnavailable("connection to the daemon is closed")
+            self._next_id += 1
+            rid = self._next_id
+            slot = _Waiter()
+            self._waiters[rid] = slot
+        frame = {"id": rid, "op": op}
+        frame.update(fields)
+        try:
+            with self._send_lock:
+                self._sock.sendall(encode_frame(frame))
+        except OSError as exc:
+            self._drop_waiter(rid)
+            raise DaemonUnavailable(f"send failed: {exc.strerror or exc}") from None
+        if not slot.event.wait(timeout):
+            self._drop_waiter(rid)
+            raise TimeoutError(f"no reply to {op!r} within {timeout}s")
+        reply = slot.reply
+        if reply is None:
+            raise DaemonUnavailable("connection to the daemon closed before a reply")
+        if not reply.get("ok"):
+            error = reply.get("error") or {}
+            raise DaemonError(error.get("code", "internal"), error.get("message", ""), error)
+        return reply.get("result") or {}
+
+    def call(self, tool: str, args: dict | None = None, timeout: float = 120.0) -> str:
+        return self.request("call", timeout=timeout, tool=tool, args=args or {})["result"]
+
+    def lease(self, action: str) -> dict:
+        return self.request("lease", action=action)
+
+    def status(self) -> dict:
+        return self.request("status")
+
+    def subscribe(self) -> dict:
+        return self.request("subscribe")
+
+    def unsubscribe(self) -> dict:
+        return self.request("unsubscribe")
+
+    def human_input(self, data: bytes) -> dict:
+        return self.request("input", data=base64.b64encode(data).decode("ascii"))
+
+    def next_event(self, timeout: float = 5.0) -> dict | None:
+        try:
+            event = self._events.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        return event
+
+    def close(self) -> None:
+        with self._waiters_lock:
+            self._closed = True
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def _drop_waiter(self, rid) -> None:
+        with self._waiters_lock:
+            self._waiters.pop(rid, None)
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                frame = self._reader.read_frame()
+                if frame is None:
+                    break
+                if "event" in frame:
+                    self._events.put(frame)
+                    continue
+                with self._waiters_lock:
+                    slot = self._waiters.pop(frame.get("id"), None)
+                if slot is not None:
+                    slot.reply = frame
+                    slot.event.set()
+        except (ProtocolError, OSError):
+            pass
+        finally:
+            with self._waiters_lock:
+                self._closed = True
+                waiters = list(self._waiters.values())
+                self._waiters.clear()
+            for slot in waiters:
+                slot.event.set()
+            self._events.put({"event": "closed"})
+
+
+class _Waiter:
+    __slots__ = ("event", "reply")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.reply: dict | None = None
+
+
+def _verify_peer_uid(sock: socket.socket) -> None:
+    """Refuse a socket whose peer is not this user's process."""
+    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", creds)
+    if uid != os.geteuid():
+        sock.close()
+        raise DaemonUnavailable("daemon socket belongs to another user")
+
+
+# ---- race-safe start -------------------------------------------------------
+
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_SPAWNED: list[subprocess.Popen] = []
+
+
+def ensure_daemon(
+    timeout: float = START_TIMEOUT_SECONDS,
+    *,
+    daemon_argv: list[str] | None = None,
+) -> DaemonClient:
+    """Connect to the per-user daemon, starting it if absent. Bounded and race-safe.
+
+    Concurrent callers converge on one daemon: whoever holds the exclusive lock
+    on ``daemon.lock`` is the only process allowed to spawn, and it passes the
+    still-locked descriptor to the child, so the lock is never released between
+    the decision to start and the daemon taking ownership. Callers that do not
+    get the lock poll for the daemon to become connectable until ``timeout``.
+
+    ``daemon_argv`` overrides the spawn command (tests); the lock descriptor is
+    appended as ``--lock-fd N``.
+    """
+    directory = ensure_runtime_dir()
+    path = directory / "daemon.sock"
+    deadline = time.monotonic() + timeout
+    spawns = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            return DaemonClient.connect(path=path, timeout=max(0.1, min(remaining, 2.0)))
+        except DaemonUnavailable:
+            pass
+        if time.monotonic() >= deadline:
+            raise DaemonUnavailable(f"the daemon did not become ready within {timeout}s")
+
+        fd = os.open(directory / "daemon.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Someone else holds the lock: a daemon is starting or running. Poll.
+            os.close(fd)
+            time.sleep(0.05)
+            continue
+
+        # We hold the lock, so no live daemon owns the socket: any file there is stale.
+        try:
+            if spawns >= MAX_SPAWN_ATTEMPTS:
+                raise DaemonUnavailable("the daemon failed to start after several attempts")
+            _remove_stale_socket(path)
+            _spawn_daemon(fd, directory, daemon_argv)
+            spawns += 1
+        except BaseException:
+            os.close(fd)
+            raise
+        # The child now holds the lock through the inherited descriptor.
+        os.close(fd)
+
+
+def _remove_stale_socket(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        raise UnsafeRuntimeDir(f"{path} exists and is not a socket; refusing to replace it")
+    os.unlink(path)
+
+
+def _spawn_daemon(lock_fd: int, directory: Path, daemon_argv: list[str] | None) -> None:
+    argv = list(daemon_argv) if daemon_argv else [sys.executable, "-m", "serial_mcp_daemon"]
+    argv += ["--lock-fd", str(lock_fd)]
+    env = dict(os.environ)
+    env["SERIAL_MCP_RUNTIME_DIR"] = str(directory)
+    devnull = subprocess.DEVNULL
+    # Reap daemons this process spawned earlier that have since exited, so a
+    # long-running client does not accumulate zombie children.
+    _SPAWNED[:] = [child for child in _SPAWNED if child.poll() is None]
+    _SPAWNED.append(subprocess.Popen(
+        argv,
+        cwd=_PACKAGE_DIR,
+        env=env,
+        stdin=devnull,
+        stdout=devnull,
+        stderr=devnull,
+        pass_fds=(lock_fd,),
+        start_new_session=True,
+        close_fds=True,
+    ))
