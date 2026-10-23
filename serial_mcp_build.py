@@ -42,22 +42,10 @@ def _inject_executable(wheel_path: Path) -> str:
     with zipfile.ZipFile(wheel_path, "r") as source:
         entries = [(item, source.read(item.filename)) for item in source.infolist()]
     record_name = next(name for name, _ in entries if name.filename.endswith(".dist-info/RECORD"))
-    wheel_stem = wheel_path.name[:-4]
-    distribution_version = "_".join(wheel_stem.split("-")[:2])
-    script_name = f"{distribution_version}.data/scripts/serial-mcp"
-    binary_name = f"{distribution_version}.data/data/bin/serial-mcp-rust-client"
+    # Keep the binary in the wheel root beside the launcher module: uv 0.12
+    # does not reliably relocate this platform-tagged wheel's `.data` payload.
+    binary_name = "serial-mcp-rust-client"
     binary = BINARY.read_bytes()
-    launcher = b"""#!/bin/sh
-case \"$0\" in
-  */*) _launcher=$0 ;;
-  *) _launcher=$(command -v \"$0\") ;;
-esac
-case \"$_launcher\" in
-  */*) _launcher_dir=${_launcher%/*} ;;
-  *) _launcher_dir=. ;;
-esac
-exec \"$_launcher_dir/serial-mcp-rust-client\" \"$@\"
-"""
     rows: list[tuple[str, str, str]] = []
     wheel_metadata = next(name for name, _ in entries if name.filename.endswith(".dist-info/WHEEL"))
     with tempfile.NamedTemporaryFile(dir=wheel_path.parent, suffix=".whl", delete=False) as temp:
@@ -74,17 +62,6 @@ exec \"$_launcher_dir/serial-mcp-rust-client\" \"$@\"
                     data = (metadata + f"\nTag: py3-none-{platform_tag}\n").encode()
                 target.writestr(item, data)
                 rows.append(_record_line(item.filename, data))
-            launcher_info = zipfile.ZipInfo(script_name)
-            launcher_info.create_system = 3
-            launcher_info.external_attr = (0o100755 << 16)
-            target.writestr(launcher_info, launcher)
-            rows.append(_record_line(script_name, launcher))
-            data_launcher_name = f"{distribution_version}.data/data/bin/serial-mcp"
-            data_launcher_info = zipfile.ZipInfo(data_launcher_name)
-            data_launcher_info.create_system = 3
-            data_launcher_info.external_attr = (0o100755 << 16)
-            target.writestr(data_launcher_info, launcher)
-            rows.append(_record_line(data_launcher_name, launcher))
             binary_info = zipfile.ZipInfo(binary_name)
             binary_info.create_system = 3
             binary_info.external_attr = (0o100755 << 16)

@@ -254,7 +254,8 @@ def test_console_scripts_and_wheel_include_every_module_they_name():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     included = set(project["tool"]["hatch"]["build"]["targets"]["wheel"]["include"])
     scripts = project["project"]["scripts"]
-    assert "serial-mcp" not in scripts  # native executable is installed as a wheel data script
+    assert scripts["serial-mcp"] == "serial_mcp_launcher:main"
+    assert "serial_mcp_launcher.py" in included
     assert scripts["serial-mcp-legacy"] == "server:main"
     assert scripts["serial-mcp-daemon"] == "serial_mcp_daemon:main"
     for target in scripts.values():
@@ -264,6 +265,7 @@ def test_console_scripts_and_wheel_include_every_module_they_name():
     assert "serial_mcp_client.py" not in included
     sdist_include = set(project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"])
     assert "serial_mcp_client.py" not in sdist_include
+    assert "serial_mcp_launcher.py" in sdist_include
 
 
 def test_rust_tool_catalog_is_generated_from_the_python_mcp_oracle():

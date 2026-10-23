@@ -1,6 +1,7 @@
 """Public-stdio integration checks for the built native frontend."""
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -148,6 +149,41 @@ def test_rust_waits_for_a_slow_daemon_tool_reply(tmp_path):
         asyncio.run(scenario())
     finally:
         fake.close()
+
+
+def test_uvx_installs_and_launches_the_native_frontend_from_source(tmp_path):
+    uvx = shutil.which("uvx")
+    if not uvx or not shutil.which("cargo"):
+        pytest.skip("uvx and Cargo are required to verify the documented source-install path")
+    runtime = tmp_path / "runtime"
+    env = {
+        "SERIAL_MCP_RUNTIME_DIR": str(runtime),
+        "SERIAL_MCP_CLIENT_NAME": "uvx-smoke",
+        "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+    }
+
+    async def scenario():
+        transport = StdioTransport(
+            command=uvx,
+            args=["--from", str(ROOT), "serial-mcp"],
+            env=env,
+            cwd=str(tmp_path),
+            keep_alive=False,
+        )
+        async with Client(transport) as client:
+            tools = {tool.name for tool in await client.list_tools()}
+            assert {"connect", "lease_acquire", "lease_status"} <= tools
+            status = await client.call_tool("lease_status", {})
+            assert not status.is_error
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        for pid in _daemon_pids_for(runtime):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
 
 def test_rust_frontend_autostarts_daemon_without_fastmcp_or_legacy_server(tmp_path):

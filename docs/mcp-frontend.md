@@ -22,7 +22,7 @@ The entry point is `serial-mcp`. It uses the same forms as before:
 | GitHub (recommended) | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
 | Local checkout | Build with `cargo build --release --locked --manifest-path rust-client/Cargo.toml`, then run `build/rust-target/release/serial-mcp-rust-client` |
 | Local checkout + nix | `nix run github:alvinla264/serial-mcp` or `nix run /path/to/serial-mcp` |
-| pip | Build/install from source with Cargo available to the PEP 517 backend; the wheel installs a tiny `serial-mcp` launcher that immediately `exec`s the bundled native Rust executable |
+| pip / uvx | Build/install from source with Cargo available to the PEP 517 backend; the wheel's `serial-mcp` console entry point immediately `exec`s the bundled native Rust executable |
 
 Serial access still needs the usual permission (`dialout` group or udev rules).
 The daemon, not the agent, opens the port, so the group must apply to the user that
@@ -75,7 +75,7 @@ daemon that is already running.
 
 ## Migrating from the old launcher
 
-- `serial-mcp` immediately execs the Rust/rmcp executable (through a small shell launcher when installed from a wheel). Existing stdio configurations retain the command name and arguments. No Python/FastMCP stdio frontend is installed.
+- `serial-mcp` immediately execs the Rust/rmcp executable (through a tiny Python console-script trampoline when installed from a wheel). Existing stdio configurations retain the command name and arguments. No Python/FastMCP stdio frontend is installed.
 - `serial-mcp-legacy` runs the previous in-process server. Each MCP process then owns
   its own device. Do not run it against a device while the daemon has that device open.
   The port is exclusive, so the second opener is refused, but the intent is one owner.

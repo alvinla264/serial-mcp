@@ -542,7 +542,7 @@ def test_packaging_ships_the_terminal_module_and_entry_point():
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert project["project"]["scripts"]["serial-mcp-terminal"] == "serial_mcp_terminal:main"
-    assert "serial-mcp" not in project["project"]["scripts"]  # installed as a native wheel data script
+    assert project["project"]["scripts"]["serial-mcp"] == "serial_mcp_launcher:main"
     assert project["project"]["scripts"]["serial-mcp-legacy"] == "server:main"
     assert project["project"]["scripts"]["serial-mcp-daemon"] == "serial_mcp_daemon:main"
     assert "serial_mcp_terminal.py" in project["tool"]["hatch"]["build"]["targets"]["wheel"]["include"]

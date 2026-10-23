@@ -1,6 +1,6 @@
 # Generic Serial MCP
 
-A lightweight native Rust/rmcp stdio frontend for a shared Python serial daemon. It does not assume a specific device, shell, login flow, prompt, or command language. The daemon and human terminal remain Python; normal MCP launches run the built executable without starting Python/FastMCP frontend code.
+A lightweight native Rust/rmcp stdio frontend for a shared Python serial daemon. It does not assume a specific device, shell, login flow, prompt, or command language. The daemon and human terminal remain Python; normal MCP launches run the built executable without starting Python/FastMCP frontend code. Wheel installs use a tiny Python console-script trampoline that immediately `exec`s the native executable.
 
 **Either side can own the device.** Serial ports cannot be shared, so one party
 holds the port and the other joins its session over a raw-byte UNIX socket:
@@ -27,7 +27,7 @@ Choose a source-based launcher or build a native executable from a local checkou
 
 Notes:
 
-- Source-based `uvx` and pip installations compile the Rust frontend once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed `serial-mcp` launcher is a native executable and never invokes Cargo on normal launches. Nix builds the binary as part of the package.
+- Source-based `uvx` and pip installations compile the Rust frontend once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed Python console-script trampoline immediately replaces itself with the bundled native executable; it never invokes Cargo or Python's MCP framework during normal launches. Nix installs the binary directly.
 - Linux and WSL are the supported Rust frontend targets. FastMCP remains a dependency for the explicit `serial-mcp-legacy` in-process server; it is not the shared-daemon stdio frontend.
 - `serial-mcp` is the Rust/rmcp stdio frontend of the shared daemon (see
   [Shared daemon](#shared-daemon-protocol-v1)). The previous in-process server is

@@ -9,7 +9,8 @@ dependencies = [
 ]
 
 [project.scripts]
-# serial-mcp is installed as a native executable by the PEP 517 build backend.
+# The console script is a tiny trampoline that immediately execs the bundled Rust binary.
+serial-mcp = "serial_mcp_launcher:main"
 # serial-mcp-legacy keeps the previous in-process server (one device per MCP process).
 serial-mcp-legacy = "server:main"
 serial-mcp-daemon = "serial_mcp_daemon:main"
@@ -21,11 +22,10 @@ build-backend = "serial_mcp_build"
 backend-path = ["."]
 
 [tool.hatch.build.targets.wheel]
-# Python modules retained for the legacy server, daemon and human terminal.
-# The default frontend is injected as a native executable; there is no Python
-# frontend console shim.
-include = ["server.py", "serial_mcp_engine.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py"]
+# Python modules retained for the launcher, legacy server, daemon and human terminal.
+# The shared-daemon frontend itself remains a native executable.
+include = ["serial_mcp_launcher.py", "server.py", "serial_mcp_engine.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["README.md", "AGENTS.md", "server.py", "serial_mcp_engine.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py", "serial_mcp_build.py", "docs/**", "rust-client/**", "pyproject.toml", "uv.lock", "flake.nix", "flake.lock"]
+include = ["README.md", "AGENTS.md", "serial_mcp_launcher.py", "server.py", "serial_mcp_engine.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py", "serial_mcp_build.py", "docs/**", "rust-client/**", "pyproject.toml", "uv.lock", "flake.nix", "flake.lock"]
 exclude = ["serial_mcp_client.py"]
