@@ -97,6 +97,34 @@ def test_rust_tools_list_and_calls_match_python_oracle(daemon, real_runtime, ech
     asyncio.run(scenario())
 
 
+def test_rust_registers_daemon_during_idle_startup(tmp_path):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    runtime = tmp_path / "runtime"
+
+    def handle(conn, frame):
+        if frame["op"] == "hello":
+            _reply(conn, frame, _hello_result())
+        return True
+
+    fake = ScriptedDaemon(runtime, handle)
+
+    async def scenario():
+        async with Client(transport(runtime, "idle-registration")) as client:
+            tools = await client.list_tools()
+            assert tools
+            deadline = time.monotonic() + 5
+            while not any(frame.get("op") == "hello" for frame in fake.frames):
+                if time.monotonic() >= deadline:
+                    raise AssertionError("idle frontend did not register with daemon")
+                await asyncio.sleep(0.01)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        fake.close()
+
+
 def test_autostarted_daemon_survives_frontend_process_group_termination(tmp_path):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")

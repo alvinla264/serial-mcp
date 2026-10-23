@@ -89,7 +89,7 @@ daemon that is already running.
 
 | Event | What happens |
 |---|---|
-| Agent starts the frontend | MCP initialization is answered immediately. The frontend connects/registers when the first tool is called; the daemon starts if it is not running. An idle frontend has no daemon registration. |
+| Agent starts the frontend | MCP initialization is answered immediately while the frontend attempts daemon connection/registration in the background. A healthy daemon starts if it is not running, and the client remains registered while idle. Registration failure does not stop MCP startup; the first tool call reports the failure. |
 | Agent exits (stdin closed) | The frontend says `bye` and closes. The daemon removes the client. If that client held control, control is released after its in-flight operation settles. The device stays connected for the other clients. |
 | Agent crashes or is killed | The kernel closes the socket. The daemon removes the client the same way. Nothing has to be remembered by the agent. |
 | Explicit `disconnect` | Only the device transport and its session surfaces close. The daemon and every client stay. This is a gated tool. |
@@ -141,7 +141,7 @@ terminal is described in its own documentation.
 - Daemon not reachable, runtime directory unsafe, or protocol mismatch: the tool error
   names the cause. A daemon announcing a different protocol version (in either its IPC
   frame or hello result) is refused with the reported version in the message; MCP
-  initialization remains available so the error reaches the agent through the tool call.
+  initialization remains available, and the failure is reported through a tool call.
 - A daemon that is draining refuses a new client's hello. The frontend retries the
   hello on a new connection, a bounded number of times. Hello changes nothing on the
   device, so this is safe.

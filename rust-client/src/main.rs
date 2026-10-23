@@ -728,6 +728,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let frontend = Frontend::new();
+    // Keep the MCP server available even if daemon startup fails, but register
+    // healthy clients before they become idle without invoking a tool.
+    let registration = frontend.clone();
+    thread::spawn(move || {
+        let _ = registration.daemon();
+    });
     let server = McpServer::new(frontend.clone())?;
     let routes = server.routes.clone().into_iter().collect::<Vec<_>>();
     let (stdin, _stdout) = stdio();
