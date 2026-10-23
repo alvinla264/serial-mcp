@@ -1,6 +1,8 @@
 """Public-stdio integration checks for the built native frontend."""
 import asyncio
+import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -93,6 +95,56 @@ def test_rust_tools_list_and_calls_match_python_oracle(daemon, real_runtime, ech
             assert unknown.is_error
 
     asyncio.run(scenario())
+
+
+def test_autostarted_daemon_survives_frontend_process_group_termination(tmp_path):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    runtime = tmp_path / "runtime"
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime), SERIAL_MCP_CLIENT_NAME="group-test")
+    frontend = subprocess.Popen(
+        [str(BINARY)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, cwd=ROOT, start_new_session=True,
+    )
+    daemon_pids = []
+    try:
+        initialize = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "clientInfo": {"name": "process-group-test", "version": "1"},
+            },
+        }
+        frontend.stdin.write((json.dumps(initialize) + "\n").encode())
+        frontend.stdin.flush()
+        ready, _, _ = select.select([frontend.stdout], [], [], 15)
+        assert ready, "native frontend did not answer initialize"
+        response = json.loads(frontend.stdout.readline())
+        assert response.get("id") == 1 and "result" in response, response
+        deadline = time.monotonic() + 5
+        while not (daemon_pids := _daemon_pids_for(runtime)) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert daemon_pids, "frontend did not auto-start the daemon"
+        daemon_pid = daemon_pids[0]
+        assert os.getpgid(daemon_pid) != os.getpgid(frontend.pid), (
+            "auto-started daemon must have its own process group"
+        )
+
+        os.killpg(os.getpgid(frontend.pid), signal.SIGTERM)
+        frontend.wait(timeout=5)
+        os.kill(daemon_pid, 0)
+    finally:
+        if frontend.poll() is None:
+            frontend.terminate()
+            frontend.wait(timeout=5)
+        for pid in _daemon_pids_for(runtime):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        frontend.stdin.close()
+        frontend.stdout.close()
+        frontend.stderr.close()
 
 
 def test_rust_never_replays_a_non_idempotent_call_after_its_reply_is_lost(tmp_path):

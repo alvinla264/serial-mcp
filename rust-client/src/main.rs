@@ -16,6 +16,7 @@ use std::{
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         net::UnixStream,
+        process::CommandExt,
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -594,6 +595,7 @@ fn ensure_daemon() -> Result<Arc<Daemon>, String> {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .current_dir(std::env::current_dir().unwrap_or_default());
+                cmd.process_group(0);
                 child = Some(cmd.spawn().map_err(|e| {
                     format!(
                         "cannot start serial-mcp daemon: {e}; install serial-mcp daemon components"
