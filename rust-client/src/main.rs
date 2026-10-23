@@ -166,7 +166,9 @@ impl Frontend {
 
     fn daemon(&self) -> Result<Arc<Daemon>, String> {
         let _guard = self.connect_lock.lock().unwrap();
-        if let Some(client) = self.client.lock().unwrap().clone() {
+        // End the guard before connection_ended locks the same mutex again.
+        let current_client = { self.client.lock().unwrap().clone() };
+        if let Some(client) = current_client {
             if !client.closed.load(Ordering::SeqCst) {
                 return Ok(client);
             }

@@ -147,6 +147,82 @@ def test_autostarted_daemon_survives_frontend_process_group_termination(tmp_path
         frontend.stderr.close()
 
 
+def test_daemon_loss_does_not_deadlock_next_mcp_call(tmp_path):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    runtime = tmp_path / "runtime"
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime), SERIAL_MCP_CLIENT_NAME="loss-test")
+    frontend = subprocess.Popen(
+        [str(BINARY)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, cwd=ROOT, start_new_session=True,
+    )
+
+    def send(message):
+        frontend.stdin.write((json.dumps(message) + "\n").encode())
+        frontend.stdin.flush()
+
+    def response_for(request_id, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([frontend.stdout], [], [], max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            line = frontend.stdout.readline()
+            if not line:
+                break
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                return message
+        raise AssertionError(f"no MCP response for request {request_id} within {timeout}s")
+
+    try:
+        send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "clientInfo": {"name": "daemon-loss-test", "version": "1"},
+            },
+        })
+        assert "result" in response_for(1)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        deadline = time.monotonic() + 5
+        while not (pids := _daemon_pids_for(runtime)) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(pids) == 1, "frontend did not start exactly one daemon"
+        os.kill(pids[0], signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while _daemon_pids_for(runtime) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not _daemon_pids_for(runtime), "killed daemon is still present"
+
+        send({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "lease_status", "arguments": {}},
+        })
+        first_after_loss = response_for(2, timeout=5)
+        assert "result" in first_after_loss, first_after_loss
+
+        send({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "lease_status", "arguments": {}},
+        })
+        recovered = response_for(3, timeout=10)
+        assert "result" in recovered and recovered["result"].get("isError") is not True, recovered
+        assert len(_daemon_pids_for(runtime)) == 1
+    finally:
+        if frontend.poll() is None:
+            frontend.terminate()
+            frontend.wait(timeout=5)
+        for pid in _daemon_pids_for(runtime):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        frontend.stdin.close()
+        frontend.stdout.close()
+        frontend.stderr.close()
+
+
 def test_rust_never_replays_a_non_idempotent_call_after_its_reply_is_lost(tmp_path):
     runtime = tmp_path / "runtime"
 
