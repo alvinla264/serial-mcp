@@ -1,0 +1,722 @@
+[
+  {
+    "description": "Acquire AI control of the serial device explicitly, as JSON.\n\nGated tools acquire control automatically when it is free. After control is\nlost (idle expiry, release, or a dropped connection) you must call this before\nthe next gated tool. A warning in the result means device state may have changed\nsince you last used it. Acquiring while another client holds control returns busy.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "lease_acquire"
+  },
+  {
+    "description": "Release AI control so another client can use the device, as JSON.\n\nRelease takes effect once any in-flight operation finishes. After releasing you\nmust call lease_acquire before gated tools work again.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "lease_release"
+  },
+  {
+    "description": "Show who holds AI control and when idle control expires, as JSON. Never renews the lease.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "lease_status"
+  },
+  {
+    "description": "Open a serial port (owning it), or join a session someone else serves.\n\nTwo modes:\n\n* `port=...` — open the device and own it. The user then attaches to this\n  server's session socket or companion pty. Calling it again for the same\n  device keeps the running session (and anyone attached) alive.\n* `attach_socket=...` — join a session already being served, typically the\n  user's own `tio -S unix:/tmp/serial-mcp-<dev>.sock <device>`. This server\n  becomes a client and never opens the port, so the user's tio keeps owning\n  the device and keeps running when this server detaches.\n\nOn Linux, direct port opens claim TIOCEXCL and check visible existing device\nholders by character-device identity (so symlink aliases are covered). A\npre-existing owner is refused without reading, flushing, or reconfiguring the\ntty; use attach_socket when it serves a tio session. Advisory lock files are\nonly a supplementary serial-mcp-instance guard. On platforms without these\nchecks, direct open fails closed.\n\nAttach mode allows the human tio owner to keep the port. File transfers in\nthis mode need explicit co-user idle confirmation because tio's raw socket\nprotocol has no transfer lock. Pass exactly one of `port` or `attach_socket`.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "attach_socket": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Session socket to join instead of opening a device."
+        },
+        "baudrate": {
+          "default": 115200,
+          "description": "Serial baud rate (direct mode).",
+          "type": "integer"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Serial device path to open and own, e.g. /dev/ttyUSB0."
+        },
+        "prompt_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional default regex terminator for send_command completion."
+        },
+        "session_socket": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "auto",
+          "description": "UNIX socket this server serves in direct mode. \"auto\"\nderives /tmp/serial-mcp-<dev>.sock; \"\" disables it."
+        },
+        "timeout": {
+          "default": 0.1,
+          "description": "Low-level read timeout used by the reader thread.",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "name": "connect"
+  },
+  {
+    "description": "Describe implemented transfer methods, limits, requirements, and safety boundaries.\n\nLinux requires a POSIX-like shell with `cat`, `base64 -d`, and a working\n`sha256sum` or OpenSSL `dgst -sha256` command.\nU-Boot upload requires YMODEM-enabled `loady`; download uses `md.b` and a\nuser-supplied prompt regex. Direct-owned sessions announce/gate their own\nsocket/pty writers and count dropped input. Attach-mode transfers require explicit\nconfirmation that all other tio clients will remain idle; the raw tio socket\nhas no lock/arbitration protocol, so this cannot be enforced remotely.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "file_transfer_capabilities"
+  },
+  {
+    "description": "Upload a local binary file to Linux storage or an explicit U-Boot RAM address.\n\nDirect-owned sessions pause their own socket/pty writers during transfer.\nAttach mode requires confirm_shared_quiescence=true after all other tio users\nagree to stay idle; raw tio sockets cannot enforce arbitration. Linux uses\nbase64 over a shell and verifies target size plus SHA-256 before installation,\nusing target sha256sum when it passes a known-output probe or OpenSSL dgst as\nfallback. U-Boot uses `loady <address>` (YMODEM CRC); target_path is the\ntransfer filename and address is required. U-Boot RAM is read back and\ncompared. The operation never flashes or executes the image.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required explicit hexadecimal RAM address for U-Boot; no default."
+        },
+        "confirm_shared_quiescence": {
+          "default": false,
+          "description": "For attach mode only, explicitly acknowledge\nthat every other human/tio client stays idle for the entire transfer.",
+          "type": "boolean"
+        },
+        "local_path": {
+          "description": "Path to a local file readable by this MCP server process.",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 8388608,
+          "description": "Maximum accepted file size, at most 8 MiB.",
+          "type": "integer"
+        },
+        "overwrite": {
+          "default": false,
+          "description": "Whether an existing destination may be replaced (Linux only).",
+          "type": "boolean"
+        },
+        "prompt_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "U-Boot prompt regex; otherwise use the configured prompt pattern."
+        },
+        "target": {
+          "default": "linux",
+          "description": "`linux` or `uboot`.",
+          "type": "string"
+        },
+        "target_path": {
+          "description": "Linux destination path, or a simple ASCII YMODEM filename on U-Boot.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 300.0,
+          "description": "Overall transfer deadline in seconds (1–1800).",
+          "type": "number"
+        }
+      },
+      "required": [
+        "local_path",
+        "target_path"
+      ],
+      "type": "object"
+    },
+    "name": "upload_file"
+  },
+  {
+    "description": "Download a Linux filesystem path or explicit U-Boot RAM range to a local file.\n\nDirect-owned sessions pause their own socket/pty writers during transfer.\nAttach mode requires confirm_shared_quiescence=true after all other tio users\nagree to stay idle; raw tio sockets cannot enforce arbitration. Linux requires\n`base64` and a working `sha256sum` or OpenSSL `dgst -sha256`. U-Boot uses\ntextual `md.b`, not an assumed serial-send command, and requires explicit address, length, and an\nanchored prompt regex. U-Boot dump verification is limited to exact byte\ncount and sequential address rows (no checksum is available).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required explicit hexadecimal U-Boot RAM address; no default."
+        },
+        "confirm_shared_quiescence": {
+          "default": false,
+          "description": "For attach mode only, explicitly acknowledge\nthat every other human/tio client stays idle for the entire transfer.",
+          "type": "boolean"
+        },
+        "length": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required U-Boot byte length; bounded by max_bytes."
+        },
+        "local_path": {
+          "description": "Local destination path; an existing file requires overwrite=true.",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 8388608,
+          "description": "Maximum accepted transfer size, at most 8 MiB.",
+          "type": "integer"
+        },
+        "overwrite": {
+          "default": false,
+          "description": "Whether the local destination may be replaced.",
+          "type": "boolean"
+        },
+        "prompt_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "U-Boot prompt regex; otherwise use the configured prompt pattern."
+        },
+        "target": {
+          "default": "linux",
+          "description": "`linux` or `uboot`.",
+          "type": "string"
+        },
+        "target_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required Linux filesystem path."
+        },
+        "timeout": {
+          "default": 300.0,
+          "description": "Overall transfer deadline in seconds (1–1800).",
+          "type": "number"
+        }
+      },
+      "required": [
+        "local_path"
+      ],
+      "type": "object"
+    },
+    "name": "download_file"
+  },
+  {
+    "description": "Join a session the user is already serving (e.g. their tio session).\n\nConvenience wrapper for connect(attach_socket=...) that defaults the socket\npath to /tmp/serial-mcp-<dev>.sock for a known device, or auto-detects the\nlive session socket when exactly one exists.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "attach_socket": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Session socket to join. Defaults to auto-detection."
+        },
+        "prompt_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional default regex terminator for send_command."
+        }
+      },
+      "type": "object"
+    },
+    "name": "attach"
+  },
+  {
+    "description": "Close the active serial connection, stop the reader, and drop session clients.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "disconnect"
+  },
+  {
+    "description": "Send text bytes to the serial port and return output observed after the send.\n\nCompletion uses terminator_regex (or the connection default prompt_regex) when supplied;\notherwise it returns after output has been quiet for idle_timeout, bounded by timeout.\nline_ending is explicit: none, lf, cr, or crlf. Data already buffered before this call is\npreserved for read_output; this call consumes only bytes received after its send point.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "encoding": {
+          "default": "utf-8",
+          "description": "Text encoding for the serial stream.",
+          "type": "string"
+        },
+        "idle_timeout": {
+          "default": 0.2,
+          "description": "Seconds of silence that ends the wait.",
+          "type": "number"
+        },
+        "line_ending": {
+          "default": "lf",
+          "description": "One of none, lf, cr, crlf.",
+          "type": "string"
+        },
+        "max_lines": {
+          "default": 0,
+          "description": "Return at most this many lines, keeping the *last* ones where\nthe prompt/result/error lives and noting how many earlier lines were\ndropped. Use it to avoid pulling large boot banners or repetitive log\nspew into context. 0 (the default) returns everything. Ignored for\nhex/raw needs — raise it or use view_io(direction=\"rx\") instead.",
+          "type": "integer"
+        },
+        "terminator_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Regex that marks completion (overrides prompt_regex)."
+        },
+        "text": {
+          "description": "Bytes to send.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": 5.0,
+          "description": "Overall cap in seconds for waiting on output.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "send_command"
+  },
+  {
+    "description": "Consume and return buffered/asynchronously arriving serial output.\n\nIf timeout is 0, returns currently buffered data immediately. If timeout is positive,\nwaits for data and then for idle_timeout of silence, never exceeding timeout.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "encoding": {
+          "default": "utf-8",
+          "description": "Text encoding for the serial stream.",
+          "type": "string"
+        },
+        "idle_timeout": {
+          "default": 0.2,
+          "description": "Seconds of silence that ends the wait.",
+          "type": "number"
+        },
+        "max_lines": {
+          "default": 0,
+          "description": "Return at most this many lines, keeping the *last* ones and\nnoting how many earlier lines were dropped. Useful when the buffer has\naccumulated boot or log noise you do not need in context. 0 (the\ndefault) returns everything.",
+          "type": "integer"
+        },
+        "timeout": {
+          "default": 0.0,
+          "description": "Overall cap in seconds.",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "name": "read_output"
+  },
+  {
+    "description": "Discard all currently buffered serial output.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "clear_output"
+  },
+  {
+    "description": "Set or clear the default regex terminator used by send_command.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "regex_pattern": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "name": "set_prompt_pattern"
+  },
+  {
+    "description": "List known bootloader-entry profiles (builtin + user-defined).\n\nUser profiles live in ~/.config/serial-mcp/profiles.json; credentials are\nstored separately in ~/.config/serial-mcp/credentials.json (mode 0600) and\nare never displayed.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_boot_profiles"
+  },
+  {
+    "description": "Store device login credentials locally for use by enter_bootloader.\n\nCredentials are written to ~/.config/serial-mcp/credentials.json with mode\n0600 (outside any repo). They are redacted from logs and view_io transcripts.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "password": {
+          "description": "Login password (stored locally only; redacted in logs).",
+          "type": "string"
+        },
+        "profile_key": {
+          "description": "Key that profiles reference via login.password_ref (or the\nprofile name itself).",
+          "type": "string"
+        },
+        "username": {
+          "description": "Login username.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile_key",
+        "username",
+        "password"
+      ],
+      "type": "object"
+    },
+    "name": "set_boot_credentials"
+  },
+  {
+    "description": "Log in to the device's shell console (no reboot, no bootloader entry).\n\nCredentials resolve like enter_bootloader's: explicit arguments win, else the\nprofile's login section, else the local credentials file. The password is\nalways written through the redacting path, so it never reaches the log file\nor the view_io transcript — prefer a profile + set_boot_credentials over\npassing a secret as an argument.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "encoding": {
+          "default": "utf-8",
+          "description": "Text encoding for the serial stream.",
+          "type": "string"
+        },
+        "login_mode": {
+          "default": "auto",
+          "description": "\"auto\" detects the login/password prompts; \"blind\" types\nEnter, username, password on a schedule, for consoles flooded with\nunsolicited logging where prompt detection reads noise.",
+          "type": "string"
+        },
+        "overall_timeout": {
+          "default": 20.0,
+          "description": "Wall-clock cap in seconds for the whole login.",
+          "type": "number"
+        },
+        "password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit password (overrides profile/credentials; prefer stored\ncredentials so the secret stays out of call arguments)."
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Profile whose login section provides username/password_ref\n(see list_boot_profiles)."
+        },
+        "username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit username (overrides profile/credentials)."
+        }
+      },
+      "type": "object"
+    },
+    "name": "login"
+  },
+  {
+    "description": "Enter the device's U-Boot bootloader automatically.\n\nFlow: optionally log in (if the device sits at a login prompt), reboot,\nwait for the autoboot window, then send interrupt keys at a paced interval\nuntil the bootloader prompt appears. Never loops forever: attempts are\ncapped and the whole operation has a wall-clock timeout.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "abort_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Regex indicating the device booted fully (e.g. \"Login:\") —\ntriggers another login+reboot cycle instead of endless tapping."
+        },
+        "delay": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds to wait after reboot before tapping begins."
+        },
+        "encoding": {
+          "default": "utf-8",
+          "description": "Text encoding for the serial stream.",
+          "type": "string"
+        },
+        "interrupt_keys": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Characters to tap during the autoboot window, e.g. [\" \"].\nSent repeatedly; each key is tried max_attempts times."
+        },
+        "interval": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds between interrupt key taps (pacing protects the RX\nbuffer — flooding can cause dropped characters in U-Boot)."
+        },
+        "login_mode": {
+          "default": "auto",
+          "description": "\"auto\" detects prompts and falls back to blind typing;\n\"blind\" skips all prompt verification and fires Enter, username,\npassword on a fixed schedule. Use \"blind\" on consoles flooded with\nunsolicited logging, where prompt detection reads noise.",
+          "type": "string"
+        },
+        "login_password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit password (overrides profile/credentials;\nprefer set_boot_credentials so secrets stay out of logs)."
+        },
+        "login_username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit username (overrides profile/credentials)."
+        },
+        "max_attempts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Hard cap on interrupt keys per pass."
+        },
+        "overall_timeout": {
+          "default": 120.0,
+          "description": "Wall-clock cap in seconds for the entire operation.",
+          "type": "number"
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Named boot profile (see list_boot_profiles). Provides defaults\nfor everything below."
+        },
+        "reboot": {
+          "default": true,
+          "description": "Whether to issue the reboot command first (False = device is\nalready cycling / power-cycled externally).",
+          "type": "boolean"
+        },
+        "reboot_command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Shell command to reboot (default from profile or \"reboot\")."
+        },
+        "success_regex": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Regex indicating the bootloader prompt was reached."
+        }
+      },
+      "type": "object"
+    },
+    "name": "enter_bootloader"
+  },
+  {
+    "description": "View recent serial I/O (tio-style timestamped TX/RX transcript).\n\nShows what was sent to the device ([TX:ai] by the AI, [TX:user] by attached\nsession users) and what came back ([RX]). direction filters to tx, rx, or\nall. hex_mode shows raw bytes in hex like tio --hex.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "direction": {
+          "default": "all",
+          "description": "One of all, tx, rx.",
+          "type": "string"
+        },
+        "encoding": {
+          "default": "utf-8",
+          "description": "Text decoding for non-hex output.",
+          "type": "string"
+        },
+        "hex_mode": {
+          "default": false,
+          "description": "Render payloads as hex instead of text.",
+          "type": "boolean"
+        },
+        "lines": {
+          "default": 50,
+          "description": "Maximum number of records to show (most recent first-tail).",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "view_io"
+  },
+  {
+    "description": "List available serial ports with descriptions (like tio --list).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_serial_ports"
+  },
+  {
+    "description": "Show connection status, the session socket path, and attach instructions.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "tio_info"
+  }
+]

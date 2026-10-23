@@ -28,16 +28,17 @@ to every party.
 | `serial_mcp_engine.py` | The device-agnostic serial engine: transports, `SerialState`, session sockets, transfers, login and bootloader machinery, `FILE_TRANSFER_CAPABILITIES`. No MCP or FastMCP import, and no state, log, device or thread at import time. Constructed deliberately by its owner (the daemon in `start()`, or `server.py`). |
 | `serial_mcp_ipc.py` | Stdlib-only daemon IPC primitives: framing, private runtime directory, race-safe `ensure_daemon`, `DaemonClient`. Must not import `server`. |
 | `serial_mcp_daemon.py` | The shared per-user daemon: device ownership, control lease, client lifetime, tool dispatch, output fan-out, human input. |
-| `serial_mcp_client.py` | The stdio MCP frontend (`serial-mcp`): a thin client of the daemon that mirrors the legacy tools. Holds no serial state. See `docs/mcp-frontend.md`. |
+| `rust-client/` | The pinned Rust/rmcp stdio frontend. Build once during installation; normal launches run the resulting native executable and connect to the Python daemon over IPC v1. See `docs/mcp-frontend.md`. |
+| `serial_mcp_client.py` | Retained Python parity oracle for migration tests; not installed as the shared-daemon frontend. |
 | `docs/daemon-ipc.md` | Frozen daemon IPC contract (protocol v1). Change it before changing the wire behaviour. |
 | `test_ipc.py`, `test_daemon.py`, `test_daemon_start.py` | Daemon and IPC tests: synthetic clients, fake ptys, real daemon subprocesses in private runtime directories. |
-| `test_mcp_client.py` | MCP frontend tests: real frontend subprocesses over MCP stdio, tool-list parity with `server.py`, lease and lifetime behaviour, scripted fake daemons. |
+| `test_mcp_client.py`, `test_rust_mcp_client.py` | Python parity-oracle tests and native frontend tests over public MCP stdio; tool catalog, daemon forwarding and lease behavior. |
 | `serial_mcp_terminal.py` | The native human terminal (`serial-mcp-terminal`): a human client of the daemon. Stdlib-only; never opens the port. See `docs/human-terminal.md`. |
 | `test_terminal.py` | Human terminal tests: the real terminal on a pty against the real daemon, with synthetic AI peers and fake devices. |
 | `test_engine_isolation.py` | Import and startup invariants in fresh subprocesses: the engine and daemon import with no side effects, the daemon serves IPC with `fastmcp`, `mcp` and `server` blocked, and exactly one engine is constructed. |
 | `test_server.py` | Pytest suite. Uses fake ptys / fake sockets — never a real device. |
 | `README.md` | User-facing documentation: install, agent configs, tool reference, protocol notes. |
-| `pyproject.toml` | Packaging + `serial-mcp` and `serial-mcp-daemon` console entry points (enables `uvx --from git+...`). |
+| `pyproject.toml`, `serial_mcp_build.py` | PEP 517 packaging; builds and installs the native `serial-mcp` script plus Python daemon/terminal entry points. |
 | `flake.nix` | Nix flake (`nix run github:...`). |
 | `AGENTS.md` | This file. |
 

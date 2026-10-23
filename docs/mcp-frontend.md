@@ -9,12 +9,9 @@ discover the daemon, or start it race-safely, and forward each tool call to it.
   companion pty and session socket that `tio` attaches to, and the AI control lease.
 - The **frontend** owns nothing on the device. It holds one daemon connection, sends
   requests, and returns the results and errors unchanged. It opens no port, starts no
-  reader, writes no log, and imports no device code. Starting it is cheap apart from the
-  MCP framework itself.
+  reader, writes no log, and imports no device code. It is a native Rust executable using the pinned rmcp SDK. Normal agent launches run this built executable directly; no Cargo or Python MCP framework is invoked. Linux and WSL are the supported frontend targets. Source builds, including wheel builds, require Cargo and a Rust toolchain; build cost is separate from launch cost.
 
-Tool names, parameters, defaults and descriptions match the legacy server
-(`serial-mcp-legacy`). A test (`test_mcp_client.py`) compares the two tool lists, so
-they cannot drift apart silently.
+Tool metadata is exported from the Python MCP oracle into `rust-client/tools.json`. The exporter normalizes FastMCP 2's sparse schema/docstring metadata into the canonical schema emitted by FastMCP 4, so `tools/export_tool_catalog.py --check` detects real drift across both development environments. `test_rust_mcp_client.py` compares the Rust public tool list with the normalized oracle and legacy server. The normal Rust process lists tools without importing Python/FastMCP, and forwards calls and lease operations over daemon protocol v1. Tool names, parameters, defaults and descriptions match the canonical catalog.
 
 ## Install and launch
 
@@ -23,9 +20,9 @@ The entry point is `serial-mcp`. It uses the same forms as before:
 | Source | Command |
 |---|---|
 | GitHub (recommended) | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
-| Local checkout + uv | `uv run --with fastmcp,pyserial /path/to/serial-mcp/serial_mcp_client.py` |
+| Local checkout | Build with `cargo build --release --locked --manifest-path rust-client/Cargo.toml`, then run `build/rust-target/release/serial-mcp-rust-client` |
 | Local checkout + nix | `nix run github:alvinla264/serial-mcp` or `nix run /path/to/serial-mcp` |
-| pip | `pip install fastmcp pyserial` and `python3 serial_mcp_client.py` in a checkout |
+| pip | Build/install from source with Cargo available to the PEP 517 backend; the wheel installs a tiny `serial-mcp` launcher that immediately `exec`s the bundled native Rust executable |
 
 Serial access still needs the usual permission (`dialout` group or udev rules).
 The daemon, not the agent, opens the port, so the group must apply to the user that
@@ -78,8 +75,7 @@ daemon that is already running.
 
 ## Migrating from the old launcher
 
-- `serial-mcp` now means the frontend. Existing configurations keep working without
-  edits, but the behaviour differs (see below).
+- `serial-mcp` immediately execs the Rust/rmcp executable (through a small shell launcher when installed from a wheel). Existing stdio configurations retain the command name and arguments. No Python/FastMCP stdio frontend is installed.
 - `serial-mcp-legacy` runs the previous in-process server. Each MCP process then owns
   its own device. Do not run it against a device while the daemon has that device open.
   The port is exclusive, so the second opener is refused, but the intent is one owner.
@@ -167,12 +163,12 @@ terminal is described in its own documentation.
 
 ## Tests
 
-`test_mcp_client.py` drives real frontend processes over MCP stdio. The daemon is either
-in-process with an injected clock (lease and grace advance without sleeps) or a real
-daemon subprocess (auto-start, races, crashes). Devices are ptys, and fake daemons are
-scripted sockets. Run with:
+`test_rust_mcp_client.py` drives the built native executable over MCP stdio; `test_mcp_client.py` retains daemon and Python-oracle coverage. The daemon is either in-process with an injected clock (lease and grace advance without sleeps) or a real daemon subprocess (auto-start, races, crashes). Devices are ptys, and fake daemons are scripted sockets. Run with:
 
 ```bash
-uv run --with fastmcp,pyserial,pytest python -m pytest -q
-nix develop -c python -m pytest -q
+cargo build --release --locked --manifest-path rust-client/Cargo.toml --target-dir build/rust-target
+SERIAL_MCP_RUST_CLIENT="$PWD/build/rust-target/release/serial-mcp-rust-client" \
+  uv run --with fastmcp,pyserial,pytest python -m pytest -q
+SERIAL_MCP_RUST_CLIENT="$(nix build .#default --no-link --print-out-paths)/bin/serial-mcp" \
+  nix develop -c python -m pytest -q
 ```
