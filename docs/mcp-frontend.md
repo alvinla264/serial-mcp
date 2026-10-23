@@ -89,7 +89,7 @@ daemon that is already running.
 
 | Event | What happens |
 |---|---|
-| Agent starts the frontend | The frontend registers with the daemon in the background. The daemon starts if it is not running. An idle but healthy frontend stays registered. |
+| Agent starts the frontend | MCP initialization is answered immediately. The frontend connects/registers when the first tool is called; the daemon starts if it is not running. An idle frontend has no daemon registration. |
 | Agent exits (stdin closed) | The frontend says `bye` and closes. The daemon removes the client. If that client held control, control is released after its in-flight operation settles. The device stays connected for the other clients. |
 | Agent crashes or is killed | The kernel closes the socket. The daemon removes the client the same way. Nothing has to be remembered by the agent. |
 | Explicit `disconnect` | Only the device transport and its session surfaces close. The daemon and every client stay. This is a gated tool. |
@@ -130,15 +130,18 @@ terminal is described in its own documentation.
 
 - A tool result is the same text the legacy tool returns. A condition the tool reports as
   text (for example `Error: Not connected to a serial port.`) is still a successful
-  result, as before.
+  result, as before. The Rust MCP transport also adds `cacheScope: "private"` and
+  `ttlMs: 0` to tool results and `tools/list` metadata where required by its MCP transport
+  schema; these hints prevent stateful device results from being treated as cacheable.
 - A refusal or failure is an MCP tool error (`isError`). Its text names the daemon error
   code and message, and for `busy` and `lease_lost` the lease object as JSON.
 - A call whose reply is lost (the connection ends, or no reply arrives within the
   bound) is reported with *the outcome is unknown; the call was not retried*. The device
   may already have acted. Check the device state before calling again.
-- Daemon not reachable, runtime directory unsafe, or protocol mismatch: the error names
-  the cause and the runtime directory and daemon log locations. A daemon announcing a
-  different protocol version is refused with that version in the message.
+- Daemon not reachable, runtime directory unsafe, or protocol mismatch: the tool error
+  names the cause. A daemon announcing a different protocol version (in either its IPC
+  frame or hello result) is refused with the reported version in the message; MCP
+  initialization remains available so the error reaches the agent through the tool call.
 - A daemon that is draining refuses a new client's hello. The frontend retries the
   hello on a new connection, a bounded number of times. Hello changes nothing on the
   device, so this is safe.

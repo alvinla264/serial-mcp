@@ -121,6 +121,14 @@ def test_autostarted_daemon_survives_frontend_process_group_termination(tmp_path
         assert ready, "native frontend did not answer initialize"
         response = json.loads(frontend.stdout.readline())
         assert response.get("id") == 1 and "result" in response, response
+        frontend.stdin.write((json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "lease_status", "arguments": {}},
+        }) + "\n").encode())
+        frontend.stdin.flush()
+        ready, _, _ = select.select([frontend.stdout], [], [], 15)
+        assert ready, "first tool call did not respond"
+        assert json.loads(frontend.stdout.readline()).get("id") == 2
         deadline = time.monotonic() + 5
         while not (daemon_pids := _daemon_pids_for(runtime)) and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -185,6 +193,11 @@ def test_daemon_loss_does_not_deadlock_next_mcp_call(tmp_path):
         })
         assert "result" in response_for(1)
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "lease_status", "arguments": {}},
+        })
+        assert "result" in response_for(2), "initial lease_status call did not register daemon"
         deadline = time.monotonic() + 5
         while not (pids := _daemon_pids_for(runtime)) and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -196,17 +209,17 @@ def test_daemon_loss_does_not_deadlock_next_mcp_call(tmp_path):
         assert not _daemon_pids_for(runtime), "killed daemon is still present"
 
         send({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "lease_status", "arguments": {}},
-        })
-        first_after_loss = response_for(2, timeout=5)
-        assert "result" in first_after_loss, first_after_loss
-
-        send({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "lease_status", "arguments": {}},
         })
-        recovered = response_for(3, timeout=10)
+        first_after_loss = response_for(3, timeout=5)
+        assert "result" in first_after_loss, first_after_loss
+
+        send({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "lease_status", "arguments": {}},
+        })
+        recovered = response_for(4, timeout=10)
         assert "result" in recovered and recovered["result"].get("isError") is not True, recovered
         assert len(_daemon_pids_for(runtime)) == 1
     finally:
@@ -245,6 +258,38 @@ def test_rust_never_replays_a_non_idempotent_call_after_its_reply_is_lost(tmp_pa
         calls = [frame for frame in fake.frames if frame["op"] == "call"]
         assert len(calls) == 1, "a non-idempotent tool call must not be replayed"
         assert fake.connections == 1
+    finally:
+        fake.close()
+
+
+@pytest.mark.parametrize("wire_version", [1, 2])
+def test_rust_delivers_daemon_protocol_mismatch_as_tool_error(tmp_path, wire_version):
+    runtime = tmp_path / f"runtime-{wire_version}"
+
+    def announce_version(conn, frame):
+        if frame["op"] == "hello":
+            if wire_version == 1:
+                _reply(conn, frame, _hello_result(protocol=2))
+            else:
+                conn.sendall(json.dumps({
+                    "v": wire_version, "id": frame["id"], "ok": True,
+                    "result": _hello_result(),
+                }).encode() + b"\n")
+            return False
+        return True
+
+    fake = ScriptedDaemon(runtime, announce_version)
+
+    async def scenario():
+        async with Client(transport(runtime, f"protocol-{wire_version}")) as client:
+            result = await client.call_tool("lease_status", {}, raise_on_error=False)
+            message = "".join(item.text for item in result.content)
+            assert result.is_error
+            assert "protocol version 2" in message
+            assert "outcome unknown" not in message
+
+    try:
+        asyncio.run(scenario())
     finally:
         fake.close()
 

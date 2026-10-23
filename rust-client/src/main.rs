@@ -191,7 +191,8 @@ impl Frontend {
                 Err(error) => return Err(format!("serial-mcp daemon handshake failed: {error}")),
             };
             if result.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL) {
-                return Err(format!("serial-mcp daemon speaks protocol {:?}; this frontend speaks {PROTOCOL}. Stop the old daemon (SIGTERM) and retry.", result.get("protocol")));
+                let version = result.get("protocol").unwrap_or(&Value::Null);
+                return Err(format!("serial-mcp daemon speaks protocol version {version}; this frontend speaks {PROTOCOL}. Stop the old daemon (SIGTERM) and retry."));
             }
             *self.client.lock().unwrap() = Some(client.clone());
             return Ok(client);
@@ -390,9 +391,21 @@ impl Daemon {
                     let Ok(frame) = serde_json::from_slice::<Value>(&line[..line.len() - 1]) else {
                         break;
                     };
-                    if frame.get("v").and_then(Value::as_u64) != Some(PROTOCOL)
-                        || !frame.is_object()
-                    {
+                    if !frame.is_object() {
+                        break;
+                    }
+                    if frame.get("v").and_then(Value::as_u64) != Some(PROTOCOL) {
+                        if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                            if let Some(tx) = weak
+                                .upgrade()
+                                .and_then(|this| this.pending.lock().unwrap().remove(&id))
+                            {
+                                let version = frame.get("v").unwrap_or(&Value::Null);
+                                let _ = tx.send(Err(format!(
+                                    "unsupported daemon protocol version {version}"
+                                )));
+                            }
+                        }
                         break;
                     }
                     let Some(this) = weak.upgrade() else { return };
@@ -715,9 +728,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let frontend = Frontend::new();
-    // MCP clients expect registration before the first tool invocation.
-    let register = frontend.clone();
-    tokio::task::spawn_blocking(move || register.daemon()).await??;
     let server = McpServer::new(frontend.clone())?;
     let routes = server.routes.clone().into_iter().collect::<Vec<_>>();
     let (stdin, _stdout) = stdio();

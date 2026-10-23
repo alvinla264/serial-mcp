@@ -507,8 +507,6 @@ version = "0.3.0"
 dependencies = [
  "libc",
  "rmcp",
- "schemars",
- "serde",
  "serde_json",
  "tokio",
 ]
