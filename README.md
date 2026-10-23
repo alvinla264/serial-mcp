@@ -1,7 +1,6 @@
 # Generic Serial MCP
 
-Small FastMCP server that exposes a generic serial transport. It does not assume a
-specific device, shell, login flow, prompt, or command language.
+A lightweight native Rust/rmcp stdio frontend for a shared Python serial daemon. It does not assume a specific device, shell, login flow, prompt, or command language. The daemon and human terminal remain Python; normal MCP launches run the built executable without starting Python/FastMCP frontend code.
 
 **Either side can own the device.** Serial ports cannot be shared, so one party
 holds the port and the other joins its session over a raw-byte UNIX socket:
@@ -18,25 +17,24 @@ Repo: https://github.com/alvinla264/serial-mcp
 
 ## Quick start
 
-There are three ways to run it, no local checkout required for any of them:
+Choose a source-based launcher or build a native executable from a local checkout:
 
 | Source | Command |
 |---|---|
 | **GitHub (recommended)** | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
-| **Local checkout + uv** | `uv run --with fastmcp,pyserial /path/to/serial-mcp/serial_mcp_client.py` |
+| **Local source build** | `cargo build --release --locked --manifest-path rust-client/Cargo.toml --target-dir build/rust-target`, then run `build/rust-target/release/serial-mcp-rust-client` |
 | **Local checkout + nix** | `nix run github:alvinla264/serial-mcp` — or `nix run /path/to/serial-mcp` |
 
 Notes:
 
-- The GitHub/uvx and nix forms fetch, build, and run straight from the repo —
-  nothing to clone or install first.
-- Plain pip works too: `pip install fastmcp pyserial`, then
-  `python3 serial_mcp_client.py` from a checkout.
-- `serial-mcp` is the stdio frontend of the shared daemon (see
+- Source-based `uvx` and pip installations compile the Rust frontend once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed `serial-mcp` launcher is a native executable and never invokes Cargo on normal launches. Nix builds the binary as part of the package.
+- Linux and WSL are the supported Rust frontend targets. FastMCP remains a dependency for the explicit `serial-mcp-legacy` in-process server; it is not the shared-daemon stdio frontend.
+- `serial-mcp` is the Rust/rmcp stdio frontend of the shared daemon (see
   [Shared daemon](#shared-daemon-protocol-v1)). The previous in-process server is
   `serial-mcp-legacy` (`server.py`). Migration and setup: [docs/mcp-frontend.md](docs/mcp-frontend.md).
-- Tests: `nix develop -c python -m pytest test_server.py`, or
-  `uv run --with fastmcp,pyserial,pytest python -m pytest test_server.py`.
+- Tests: build the Rust frontend and run the full uv suite; the full Nix suite
+  also exercises the native frontend from the built package. Commands are in
+  [Frontend tests](docs/mcp-frontend.md#tests).
 - Serial permissions still apply outside nix: your user needs `dialout` group
   membership (or udev rules) to open `/dev/ttyUSB0`.
 

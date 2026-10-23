@@ -19,10 +19,16 @@
         ];
         
         pythonEnv = pkgs.python3.withPackages pythonPackages;
+        rustClient = pkgs.rustPlatform.buildRustPackage {
+          pname = "serial-mcp-rust-client";
+          version = "0.3.0";
+          src = ./rust-client;
+          cargoLock.lockFile = ./rust-client/Cargo.lock;
+        };
       in
       {
         devShells.default = pkgs.mkShell {
-          buildInputs = [ pythonEnv ];
+          buildInputs = [ pythonEnv pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy ];
         };
 
         packages.default = pkgs.stdenv.mkDerivation {
@@ -31,18 +37,17 @@
           buildInputs = [ pythonEnv pkgs.makeWrapper ];
           installPhase = ''
             mkdir -p $out/bin $out/share/serial-mcp
-            # Modules live beside the launchers so the MCP frontend, the legacy
-            # MCP server and the daemon (which uses serial_mcp_engine, not server.py)
-            # all resolve them.
-            cp server.py serial_mcp_engine.py serial_mcp_client.py serial_mcp_ipc.py serial_mcp_daemon.py serial_mcp_terminal.py $out/share/serial-mcp/
-            # serial-mcp is the stdio MCP frontend of the shared daemon.
-            cp serial_mcp_client.py $out/bin/serial-mcp
+            # Modules live beside the launchers so the legacy MCP server and
+            # Python daemon (which uses serial_mcp_engine, not server.py) resolve them.
+            cp server.py serial_mcp_engine.py serial_mcp_ipc.py serial_mcp_daemon.py serial_mcp_terminal.py $out/share/serial-mcp/
+            # The compiled rmcp frontend is ready-built at installation; runtime launch never invokes cargo.
+            cp ${rustClient}/bin/serial-mcp-rust-client $out/bin/serial-mcp
             chmod +x $out/bin/serial-mcp
             # serial-mcp-legacy is the previous in-process server (one device per MCP process).
             cp server.py $out/bin/serial-mcp-legacy
             chmod +x $out/bin/serial-mcp-legacy
 
-            # Wrap the scripts to use the correct python environment
+            # The native frontend needs the Python daemon on PATH/PYTHONPATH only when starting it.
             wrapProgram $out/bin/serial-mcp \
               --prefix PATH : ${pythonEnv}/bin \
               --prefix PYTHONPATH : $out/share/serial-mcp

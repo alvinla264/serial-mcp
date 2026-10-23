@@ -1,6 +1,6 @@
 [project]
 name = "serial-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Generic serial transport MCP server with a shareable tio-style session"
 requires-python = ">=3.10"
 dependencies = [
@@ -9,22 +9,23 @@ dependencies = [
 ]
 
 [project.scripts]
-# serial-mcp is the thin stdio MCP frontend of the shared daemon (docs/mcp-frontend.md).
+# serial-mcp is installed as a native executable by the PEP 517 build backend.
 # serial-mcp-legacy keeps the previous in-process server (one device per MCP process).
-serial-mcp = "serial_mcp_client:main"
 serial-mcp-legacy = "server:main"
 serial-mcp-daemon = "serial_mcp_daemon:main"
 serial-mcp-terminal = "serial_mcp_terminal:main"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["hatchling", "editables"]
+build-backend = "serial_mcp_build"
+backend-path = ["."]
 
 [tool.hatch.build.targets.wheel]
-# Top-level modules at the wheel root so the console entry points resolve:
-# server (legacy MCP server, FastMCP adapter), serial_mcp_engine (device-agnostic
-# serial engine, no MCP), serial_mcp_client (stdio MCP frontend),
-# serial_mcp_ipc (stdlib-only IPC/client helpers), serial_mcp_daemon (shared
-# daemon) and serial_mcp_terminal (human terminal). See docs/daemon-ipc.md,
-# docs/mcp-frontend.md and docs/human-terminal.md.
-include = ["server.py", "serial_mcp_engine.py", "serial_mcp_client.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py"]
+# Python modules retained for the legacy server, daemon and human terminal.
+# The default frontend is injected as a native executable; there is no Python
+# frontend console shim.
+include = ["server.py", "serial_mcp_engine.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["README.md", "AGENTS.md", "server.py", "serial_mcp_engine.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py", "serial_mcp_terminal.py", "serial_mcp_build.py", "docs/**", "rust-client/**", "pyproject.toml", "uv.lock", "flake.nix", "flake.lock"]
+exclude = ["serial_mcp_client.py"]
