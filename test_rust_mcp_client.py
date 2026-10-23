@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+import serial as pyserial
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
@@ -95,6 +97,71 @@ def test_rust_tools_list_and_calls_match_python_oracle(daemon, real_runtime, ech
             assert unknown.is_error
 
     asyncio.run(scenario())
+
+
+def test_rust_local_source_build_starts_daemon_outside_repository_cwd(tmp_path):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    runtime = tmp_path / "runtime"
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime), SERIAL_MCP_CLIENT_NAME="cwd-test")
+    env.pop("PYTHONPATH", None)
+    isolated_python = tmp_path / "isolated-python"
+    purelib = json.dumps(str(Path(pyserial.__file__).parent.parent))
+    isolated_python.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = \"-m\" ] || exit 64\n"
+        f"exec {shlex.quote(sys.executable)} -S -c "
+        f"'import runpy,sys; sys.path.insert(0, {purelib}); "
+        f"module=sys.argv[1]; sys.argv=[module]; "
+        f"runpy.run_module(module, run_name=\"__main__\")' \"$2\"\n"
+    )
+    isolated_python.chmod(0o700)
+    env["PYTHON"] = str(isolated_python)
+    frontend = subprocess.Popen(
+        [str(BINARY)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, cwd=tmp_path,
+    )
+
+    def send(message):
+        frontend.stdin.write((json.dumps(message) + "\n").encode())
+        frontend.stdin.flush()
+
+    def receive(request_id, timeout=25):
+        ready, _, _ = select.select([frontend.stdout], [], [], timeout)
+        assert ready, f"frontend gave no response to MCP request {request_id}"
+        response = json.loads(frontend.stdout.readline())
+        assert response.get("id") == request_id, response
+        return response
+
+    try:
+        send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "clientInfo": {"name": "source-cwd-test", "version": "1"},
+            },
+        })
+        assert "result" in receive(1)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "lease_status", "arguments": {}},
+        })
+        reply = receive(2)
+        assert reply.get("result", {}).get("isError") is not True, reply
+        assert len(_daemon_pids_for(runtime)) == 1
+    finally:
+        if frontend.poll() is None:
+            frontend.terminate()
+            frontend.wait(timeout=5)
+        for pid in _daemon_pids_for(runtime):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        frontend.stdin.close()
+        frontend.stdout.close()
+        frontend.stderr.close()
 
 
 def test_rust_registers_daemon_during_idle_startup(tmp_path):

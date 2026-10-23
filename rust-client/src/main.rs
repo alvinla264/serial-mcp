@@ -556,6 +556,15 @@ fn connect(path: &Path) -> Result<UnixStream, String> {
     Ok(stream)
 }
 
+fn daemon_module_dir() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?.canonicalize().ok()?;
+    executable
+        .ancestors()
+        .filter(|path| path.is_dir())
+        .find(|path| path.join("serial_mcp_daemon.py").is_file())
+        .map(Path::to_path_buf)
+}
+
 fn ensure_daemon() -> Result<Arc<Daemon>, String> {
     let dir = runtime_dir()?;
     let sock = dir.join("daemon.sock");
@@ -609,7 +618,11 @@ fn ensure_daemon() -> Result<Arc<Daemon>, String> {
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .current_dir(std::env::current_dir().unwrap_or_default());
+                    .current_dir(
+                        daemon_module_dir()
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_default(),
+                    );
                 cmd.process_group(0);
                 child = Some(cmd.spawn().map_err(|e| {
                     format!(
