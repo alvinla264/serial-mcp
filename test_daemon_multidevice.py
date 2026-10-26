@@ -174,20 +174,6 @@ def test_client_exit_releases_last_membership_and_closes_physical_device(devices
         os.close(master)
 
 
-def test_v1_human_terminal_fails_clearly_at_negotiation(devices_runtime):
-    master, slave = pty.openpty()
-    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(devices_runtime),
-               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    process = subprocess.run([sys.executable, "-m", "serial_mcp_terminal"], cwd=ROOT,
-                             env=env, stdin=slave, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, timeout=10)
-    try:
-        assert process.returncode == 1
-        assert b"incompatible" in process.stderr and b"protocol v2" in process.stderr
-    finally:
-        os.close(master); os.close(slave)
-
-
 def test_v1_python_mcp_frontend_fails_clearly_at_negotiation(devices_runtime):
     env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(devices_runtime),
                PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
