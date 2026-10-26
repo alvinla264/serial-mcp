@@ -9,12 +9,9 @@ discover the daemon, or start it race-safely, and forward each tool call to it.
   companion pty and session socket that `tio` attaches to, and the AI control lease.
 - The **frontend** owns nothing on the device. It holds one daemon connection, sends
   requests, and returns the results and errors unchanged. It opens no port, starts no
-  reader, writes no log, and imports no device code. Starting it is cheap apart from the
-  MCP framework itself.
+  reader, writes no log, and imports no device code. It is a native Rust executable using the pinned rmcp SDK. Normal agent launches run this built executable directly; no Cargo or Python MCP framework is invoked. Linux and WSL are the supported frontend targets. Source builds, including wheel builds, require Cargo and a Rust toolchain; build cost is separate from launch cost.
 
-Tool names, parameters, defaults and descriptions match the legacy server
-(`serial-mcp-legacy`). A test (`test_mcp_client.py`) compares the two tool lists, so
-they cannot drift apart silently.
+Tool metadata is exported from the Python MCP oracle into `rust-client/tools.json`. The exporter normalizes FastMCP 2's sparse schema/docstring metadata into the canonical schema emitted by FastMCP 4, so `tools/export_tool_catalog.py --check` detects real drift across both development environments. `test_rust_mcp_client.py` compares the Rust public tool list with the normalized oracle and legacy server. The normal Rust process lists tools without importing Python/FastMCP, and forwards calls and lease operations over daemon protocol v1. Tool names, parameters, defaults and descriptions match the canonical catalog.
 
 ## Install and launch
 
@@ -23,9 +20,9 @@ The entry point is `serial-mcp`. It uses the same forms as before:
 | Source | Command |
 |---|---|
 | GitHub (recommended) | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
-| Local checkout + uv | `uv run --with fastmcp,pyserial /path/to/serial-mcp/serial_mcp_client.py` |
+| Local checkout | Build with `cargo build --release --locked --manifest-path rust-client/Cargo.toml`, then run `build/rust-target/release/serial-mcp-rust-client` |
 | Local checkout + nix | `nix run github:alvinla264/serial-mcp` or `nix run /path/to/serial-mcp` |
-| pip | `pip install fastmcp pyserial` and `python3 serial_mcp_client.py` in a checkout |
+| pip / uvx | Build/install from source with Cargo available to the PEP 517 backend; the wheel's `serial-mcp` console entry point immediately `exec`s the bundled native Rust executable |
 
 Serial access still needs the usual permission (`dialout` group or udev rules).
 The daemon, not the agent, opens the port, so the group must apply to the user that
@@ -78,8 +75,7 @@ daemon that is already running.
 
 ## Migrating from the old launcher
 
-- `serial-mcp` now means the frontend. Existing configurations keep working without
-  edits, but the behaviour differs (see below).
+- `serial-mcp` immediately execs the Rust/rmcp executable (through a tiny Python console-script trampoline when installed from a wheel). Existing stdio configurations retain the command name and arguments. No Python/FastMCP stdio frontend is installed.
 - `serial-mcp-legacy` runs the previous in-process server. Each MCP process then owns
   its own device. Do not run it against a device while the daemon has that device open.
   The port is exclusive, so the second opener is refused, but the intent is one owner.
@@ -93,7 +89,7 @@ daemon that is already running.
 
 | Event | What happens |
 |---|---|
-| Agent starts the frontend | The frontend registers with the daemon in the background. The daemon starts if it is not running. An idle but healthy frontend stays registered. |
+| Agent starts the frontend | MCP initialization is answered immediately while the frontend attempts daemon connection/registration in the background. A healthy daemon starts if it is not running, and the client remains registered while idle. Registration failure does not stop MCP startup; the first tool call reports the failure. |
 | Agent exits (stdin closed) | The frontend says `bye` and closes. The daemon removes the client. If that client held control, control is released after its in-flight operation settles. The device stays connected for the other clients. |
 | Agent crashes or is killed | The kernel closes the socket. The daemon removes the client the same way. Nothing has to be remembered by the agent. |
 | Explicit `disconnect` | Only the device transport and its session surfaces close. The daemon and every client stay. This is a gated tool. |
@@ -134,15 +130,18 @@ terminal is described in its own documentation.
 
 - A tool result is the same text the legacy tool returns. A condition the tool reports as
   text (for example `Error: Not connected to a serial port.`) is still a successful
-  result, as before.
+  result, as before. The Rust MCP transport also adds `cacheScope: "private"` and
+  `ttlMs: 0` to tool results and `tools/list` metadata where required by its MCP transport
+  schema; these hints prevent stateful device results from being treated as cacheable.
 - A refusal or failure is an MCP tool error (`isError`). Its text names the daemon error
   code and message, and for `busy` and `lease_lost` the lease object as JSON.
 - A call whose reply is lost (the connection ends, or no reply arrives within the
   bound) is reported with *the outcome is unknown; the call was not retried*. The device
   may already have acted. Check the device state before calling again.
-- Daemon not reachable, runtime directory unsafe, or protocol mismatch: the error names
-  the cause and the runtime directory and daemon log locations. A daemon announcing a
-  different protocol version is refused with that version in the message.
+- Daemon not reachable, runtime directory unsafe, or protocol mismatch: the tool error
+  names the cause. A daemon announcing a different protocol version (in either its IPC
+  frame or hello result) is refused with the reported version in the message; MCP
+  initialization remains available, and the failure is reported through a tool call.
 - A daemon that is draining refuses a new client's hello. The frontend retries the
   hello on a new connection, a bounded number of times. Hello changes nothing on the
   device, so this is safe.
@@ -167,12 +166,12 @@ terminal is described in its own documentation.
 
 ## Tests
 
-`test_mcp_client.py` drives real frontend processes over MCP stdio. The daemon is either
-in-process with an injected clock (lease and grace advance without sleeps) or a real
-daemon subprocess (auto-start, races, crashes). Devices are ptys, and fake daemons are
-scripted sockets. Run with:
+`test_rust_mcp_client.py` drives the built native executable over MCP stdio; `test_mcp_client.py` retains daemon and Python-oracle coverage. The daemon is either in-process with an injected clock (lease and grace advance without sleeps) or a real daemon subprocess (auto-start, races, crashes). Devices are ptys, and fake daemons are scripted sockets. Run with:
 
 ```bash
-uv run --with fastmcp,pyserial,pytest python -m pytest -q
-nix develop -c python -m pytest -q
+cargo build --release --locked --manifest-path rust-client/Cargo.toml --target-dir build/rust-target
+SERIAL_MCP_RUST_CLIENT="$PWD/build/rust-target/release/serial-mcp-rust-client" \
+  uv run --with fastmcp,pyserial,pytest python -m pytest -q
+SERIAL_MCP_RUST_CLIENT="$(nix build .#default --no-link --print-out-paths)/bin/serial-mcp" \
+  nix develop -c python -m pytest -q
 ```

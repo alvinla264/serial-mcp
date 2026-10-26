@@ -1,10 +1,11 @@
-"""Tests for the stdio MCP frontend (serial_mcp_client.py) against the shared daemon.
+"""Tests for the Python parity oracle and shared daemon.
 
-The public seam is MCP over stdio: each agent instance is a real frontend
-subprocess driven by a FastMCP client. The daemon is either in-process with an
-injected clock (lease and grace are advanced explicitly, never slept) or a real
-daemon subprocess (for auto-start, crash and race behaviour). Devices are ptys
-and fake daemons are small scripted UNIX sockets. No real hardware is used.
+The public seam is MCP over stdio: each oracle process is driven by a FastMCP
+client. The daemon is either in-process with an injected clock (lease and grace
+are advanced explicitly, never slept) or a real daemon subprocess (auto-start,
+crash and race behaviour). Devices are ptys and fake-daemon peers are scripted
+UNIX sockets; no hardware is touched. Native frontend coverage is in
+``test_rust_mcp_client.py``.
 """
 
 import asyncio
@@ -253,12 +254,24 @@ def test_console_scripts_and_wheel_include_every_module_they_name():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     included = set(project["tool"]["hatch"]["build"]["targets"]["wheel"]["include"])
     scripts = project["project"]["scripts"]
-    assert scripts["serial-mcp"] == "serial_mcp_client:main"
+    assert scripts["serial-mcp"] == "serial_mcp_launcher:main"
+    assert "serial_mcp_launcher.py" in included
     assert scripts["serial-mcp-legacy"] == "server:main"
     assert scripts["serial-mcp-daemon"] == "serial_mcp_daemon:main"
     for target in scripts.values():
         module = target.split(":")[0]
         assert f"{module}.py" in included, f"wheel does not include {module}.py"
+    assert project["build-system"]["build-backend"] == "serial_mcp_build"
+    assert "serial_mcp_client.py" not in included
+    sdist_include = set(project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"])
+    assert "serial_mcp_client.py" not in sdist_include
+    assert "serial_mcp_launcher.py" in sdist_include
+
+
+def test_rust_tool_catalog_is_generated_from_the_python_mcp_oracle():
+    result = subprocess.run([sys.executable, str(ROOT / "tools" / "export_tool_catalog.py"), "--check"],
+                            cwd=ROOT, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_importing_the_frontend_starts_no_device_state_daemon_or_log(tmp_path):

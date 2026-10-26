@@ -249,12 +249,16 @@ def test_legacy_server_reexports_engine_objects():
     assert server.SocketTransport is engine.SocketTransport
 
 
-def test_packaging_ships_every_top_level_module_the_entry_points_import():
+def test_packaging_ships_python_entry_points_and_native_frontend_trampoline():
     tomllib = pytest.importorskip("tomllib")
     data = tomllib.loads((REPO / "pyproject.toml").read_text())
     included = set(data["tool"]["hatch"]["build"]["targets"]["wheel"]["include"])
-    for module in ("server.py", "serial_mcp_client.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py",
+    for module in ("server.py", "serial_mcp_ipc.py", "serial_mcp_daemon.py",
                    "serial_mcp_terminal.py", "serial_mcp_engine.py"):
         assert module in included, f"{module} missing from the wheel include list"
+    assert "serial_mcp_client.py" not in included
+    assert "serial_mcp_launcher.py" in included
+    assert data["project"]["scripts"]["serial-mcp"] == "serial_mcp_launcher:main"
+    assert data["build-system"]["build-backend"] == "serial_mcp_build"
     flake = (REPO / "flake.nix").read_text()
     assert "serial_mcp_engine.py" in flake, "flake installPhase must copy the engine module"
