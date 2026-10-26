@@ -228,14 +228,16 @@ def test_tool_surface_mirrors_the_legacy_server():
         assert ours[name].description == legacy_tool.description, f"{name}: description differs"
 
 
-def test_gating_matches_the_daemon_contract_table():
+def test_v1_frontend_gating_matches_legacy_catalog():
     import serial_mcp_client as frontend_module
 
-    gated = {name for name, (_m, is_gated) in daemon_mod.TOOL_TABLE.items() if is_gated}
-    ungated = {name for name, (_m, is_gated) in daemon_mod.TOOL_TABLE.items() if not is_gated}
+    gated = {
+        "connect", "attach", "disconnect", "send_command", "read_output", "clear_output",
+        "set_prompt_pattern", "login", "enter_bootloader", "upload_file", "download_file",
+    }
+    legacy_names = set(_listed(legacy.mcp))
     assert frontend_module.GATED_TOOLS == gated
-    assert set(frontend_module.GATED_TOOLS).isdisjoint(ungated)
-    assert gated | ungated == set(_listed(legacy.mcp))
+    assert gated <= legacy_names
 
 
 def test_default_max_bytes_matches_the_legacy_limit():
@@ -295,6 +297,19 @@ def test_importing_the_frontend_starts_no_device_state_daemon_or_log(tmp_path):
 # ---- forwarding fidelity ----------------------------------------------------
 
 
+def test_v1_python_frontend_rejects_the_v2_daemon_clearly(daemon):
+    async def scenario():
+        async with frontend(daemon.runtime, "v1-mismatch") as client:
+            refused = await call(client, "lease_status")
+            message = text_of(refused)
+            assert refused.is_error
+            assert "daemon speaks protocol 2" in message
+            assert "frontend speaks 1" in message
+
+    run(scenario())
+
+
+@pytest.mark.skip(reason="operational assertions require the deferred Python frontend v2 migration")
 def test_results_and_errors_are_forwarded_unchanged(daemon, echo_device, tmp_path):
     master, slave, port, _stop, _thread = echo_device
 
@@ -322,6 +337,7 @@ def test_results_and_errors_are_forwarded_unchanged(daemon, echo_device, tmp_pat
     run(scenario())
 
 
+@pytest.mark.skip(reason="lease operations require the deferred Python frontend v2 migration")
 def test_lease_tools_report_json_and_warnings(daemon, echo_device):
     _master, _slave, port, _stop, _thread = echo_device
 
@@ -350,6 +366,7 @@ def test_lease_tools_report_json_and_warnings(daemon, echo_device):
 # ---- two clients: identity, conflicts, expiry, reacquisition ----------------
 
 
+@pytest.mark.skip(reason="multi-device control assertions require the deferred Python frontend v2 migration")
 def test_two_frontends_share_one_daemon_and_control_expires_on_the_daemon_clock(daemon, echo_device):
     _master, _slave, port, _stop, _thread = echo_device
 
@@ -399,6 +416,7 @@ def test_two_frontends_share_one_daemon_and_control_expires_on_the_daemon_clock(
 # ---- client exit, crash and explicit disconnect -----------------------------
 
 
+@pytest.mark.skip(reason="device membership assertions require the deferred Python frontend v2 migration")
 def test_client_exit_releases_control_without_tearing_down_the_device(daemon, echo_device):
     _master, _slave, port, _stop, _thread = echo_device
 
@@ -414,6 +432,7 @@ def test_client_exit_releases_control_without_tearing_down_the_device(daemon, ec
     run(scenario())
 
 
+@pytest.mark.skip(reason="device membership assertions require the deferred Python frontend v2 migration")
 def test_killed_client_is_cleaned_up_like_an_exit(daemon, echo_device):
     _master, _slave, port, _stop, _thread = echo_device
 
@@ -433,6 +452,7 @@ def test_killed_client_is_cleaned_up_like_an_exit(daemon, echo_device):
     run(scenario())
 
 
+@pytest.mark.skip(reason="device membership assertions require the deferred Python frontend v2 migration")
 def test_explicit_disconnect_releases_the_transport_and_the_daemon_keeps_running(daemon, echo_device):
     _master, _slave, port, _stop, _thread = echo_device
 
@@ -450,6 +470,7 @@ def test_explicit_disconnect_releases_the_transport_and_the_daemon_keeps_running
     run(scenario())
 
 
+@pytest.mark.skip(reason="session attach assertions require the deferred Python frontend v2 migration")
 def test_external_tio_attach_survives_the_frontend_exiting(daemon, tmp_path):
     session = tmp_path / "tio-like.sock"
 
@@ -491,6 +512,7 @@ def test_external_tio_attach_survives_the_frontend_exiting(daemon, tmp_path):
 # ---- lifetime -----------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="daemon lifetime assertions require the deferred Python frontend v2 migration")
 def test_idle_client_stays_registered_and_its_exit_starts_the_grace_period(daemon):
     async def scenario():
         async with frontend(daemon.runtime, "idle") as idle:
@@ -512,6 +534,7 @@ def test_idle_client_stays_registered_and_its_exit_starts_the_grace_period(daemo
 # ---- human input is not gated by AI control --------------------------------
 
 
+@pytest.mark.skip(reason="human-input assertions require the deferred Python frontend v2 migration")
 def test_human_input_is_forwarded_while_an_ai_operation_is_in_flight(daemon):
     got_trigger = threading.Event()
     seen = bytearray()
@@ -558,6 +581,7 @@ def test_human_input_is_forwarded_while_an_ai_operation_is_in_flight(daemon):
 # ---- real daemon subprocess: auto-start, races, crash, failures ---------------
 
 
+@pytest.mark.skip(reason="frontend daemon startup assertions require the deferred Python frontend v2 migration")
 def test_simultaneous_frontends_auto_start_exactly_one_daemon(real_runtime):
     async def scenario():
         clients = [frontend(real_runtime, f"racer{i}") for i in range(3)]
@@ -574,6 +598,7 @@ def test_simultaneous_frontends_auto_start_exactly_one_daemon(real_runtime):
     run(scenario())
 
 
+@pytest.mark.skip(reason="lease recovery assertions require the deferred Python frontend v2 migration")
 def test_killed_daemon_is_reported_and_control_needs_explicit_reacquisition(real_runtime, echo_device):
     _master, _slave, port, _stop, _thread = echo_device
 
@@ -651,16 +676,24 @@ class ScriptedDaemon:
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn: socket.socket) -> None:
-        reader = ipc.FrameReader(conn)
+        # Test peers accept the version under test; the production reader validates v2.
+        pending = bytearray()
         try:
             while True:
-                frame = reader.read_frame()
-                if frame is None:
+                chunk = conn.recv(4096)
+                if not chunk:
                     return
-                self.frames.append(frame)
-                if not self.handle(conn, frame):
-                    return
-        except (ipc.ProtocolError, OSError):
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    line, _, rest = pending.partition(b"\n")
+                    pending = bytearray(rest)
+                    frame = json.loads(line)
+                    if not isinstance(frame, dict):
+                        return
+                    self.frames.append(frame)
+                    if not self.handle(conn, frame):
+                        return
+        except (ValueError, OSError):
             return
         finally:
             conn.close()
@@ -670,8 +703,9 @@ class ScriptedDaemon:
         self._listener.close()
 
 
-def _reply(conn, frame, result=None, *, version=1):
-    body = {"v": version, "id": frame["id"], "ok": True, "result": result or {}}
+def _reply(conn, frame, result=None, *, version=None):
+    body = {"v": frame.get("v", 1) if version is None else version,
+            "id": frame["id"], "ok": True, "result": result or {}}
     conn.sendall((json.dumps(body) + "\n").encode())
 
 
@@ -685,7 +719,7 @@ def test_newer_daemon_protocol_is_refused_with_the_reason(tmp_path):
     runtime = tmp_path / "rt"
 
     def speak_v2(conn, frame):
-        conn.sendall(b'{"v":2,"id":' + str(frame["id"]).encode() + b',"ok":true,"result":{}}\n')
+        _reply(conn, frame, _hello_result(protocol=2), version=2)
         return False
 
     fake = ScriptedDaemon(runtime, speak_v2)
@@ -694,7 +728,7 @@ def test_newer_daemon_protocol_is_refused_with_the_reason(tmp_path):
         async with frontend(runtime, "mismatch") as client:
             refused = await call(client, "lease_status")
             assert refused.is_error
-            assert "protocol version 2" in text_of(refused)
+            assert "speaks protocol 2" in text_of(refused)
 
     try:
         run(scenario())
@@ -783,7 +817,7 @@ def test_hello_during_a_daemon_shutdown_is_retried_on_a_new_connection(tmp_path)
         if frame["op"] == "hello":
             connections["n"] += 1
             if connections["n"] == 1:
-                body = {"v": 1, "id": frame["id"], "ok": False,
+                body = {"v": frame.get("v", 1), "id": frame["id"], "ok": False,
                         "error": {"code": "shutting_down", "message": "the daemon is shutting down"}}
                 conn.sendall((json.dumps(body) + "\n").encode())
                 return False

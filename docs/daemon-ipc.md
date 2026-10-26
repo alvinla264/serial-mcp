@@ -48,10 +48,12 @@ First request is `hello`:
   `client_id` is private to that caller's handshake; never disclose other client
   names, IDs, or membership mappings.
 - `status {}` → `{protocol,daemon_version,clients,grace,shutting_down,devices}`.
-  Each device snapshot is `{device_id,port,state:"connected"|"closing",
-  baudrate,control:"available"|"held",members:n,generation}`. No controller
-  identity is exposed. `clients` counts every registered client, including
-  clients with no memberships; `members` is the number of AI/human participants
+  Each device snapshot is `{device_id,port,state:"connected"|"disconnected"|"closing",
+  baudrate,control:"available"|"held",members:n,generation}`. A vanished tty is
+  reported as `disconnected`; a later `connect` on the same selector reopens it
+  before returning success. No controller identity is exposed. `clients` counts
+  every registered client, including clients with no memberships; `members` is
+  the number of AI/human participants
   joined to that device.
 - `call {tool,args}` invokes an approved engine tool. Device-affecting tools
   require `args.port`; `connect` also requires `baudrate`. `connect(port,baudrate)`
@@ -126,9 +128,14 @@ affected; do not infer success or failure from the warning.
 
 ## Events, cursors and backpressure
 
-Events: `settings` (accepted baud change), `settings_gap` (coalesced/evicted settings), `device` (joined/left/open/closed,
-with snapshot-safe fields), `output`, `output_gap`, `control_lost`, `clients`
-(count only), `event_gap` (local client event queue overflow), and `shutdown`.
+Events: `settings` (accepted baud change), `settings_gap` (coalesced/evicted
+settings), and `device` with `state` equal to `open` (physical tty opened or
+reopened), `joined` / `left` (membership changed), `disconnected` (physical tty
+vanished), or `closed` (physical tty close completed). Device events carry
+snapshot-safe `device_id`, `port`, `baudrate`, and `generation` fields. `output`,
+`output_gap`, `control_lost`, `clients` (count only), `event_gap` (local client
+event queue overflow), and `shutdown` are also emitted. These names describe the
+wire states; `connected` is a status snapshot value, not a device-event state.
 Events are not authorization. MCP clients retain
 settings notices in a bounded per-device queue and prepend notices to the next
 response for that device; TUI updates its view promptly. No model-wakeup promise.

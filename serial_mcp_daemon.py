@@ -81,6 +81,7 @@ class Device:
     members: set["Connection"] = field(default_factory=set)
     controller: "Connection | None" = None
     active: int = 0
+    in_flight: int = 0
     idle_since: float | None = None
     generation: int = 0
     rx_offset: int = 0
@@ -92,6 +93,11 @@ class Device:
     pending_release: bool = False
     settings_lock: threading.Lock = field(default_factory=threading.Lock)
     rx_listener: object | None = None
+    paths: set[str] = field(default_factory=set)
+    node_fingerprint: tuple[int, int, int, int] | None = None
+    online: bool = False
+    recovering: bool = False
+    close_when_idle: bool = False
 
 
 class DaemonAlreadyRunning(Exception):
@@ -542,6 +548,7 @@ class DaemonServer:
         self._clients: set[Connection] = set()
         self._ids = itertools.count(1)
         self._shutting_down = False
+        self._shutdown_deadline: float | None = None
         self._stopped = threading.Event()
         self._grace_started: float | None = None
         self._devices: dict[tuple[int, int], Device] = {}
@@ -626,24 +633,32 @@ class DaemonServer:
 
     def stop(self, reason: str = "requested") -> None:
         """Drain in-flight work, release the device, and stop listening."""
+        deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
         with self._lock:
             if self._shutting_down:
                 return
             self._shutting_down = True
+            self._shutdown_deadline = deadline
             for conn in list(self._connections):
                 conn.send_control({"v": PROTOCOL_VERSION, "event": "shutdown", "reason": reason})
         self._close_listener()
-        # Unregister first, then wait for every accepted device operation to
-        # settle before a physical transport can be closed. Engine operations
-        # carry their own finite timeouts (file transfers are bounded at 1800s).
+        # Unregister first, then wait only until the shared drain deadline.
+        # A transfer can outlive it; client cleanup is deferred to operation end,
+        # while process shutdown proceeds with the bounded close attempt below.
         for conn in list(self._connections):
             conn.close()
         with self._drained:
-            while any(device.active for device in self._devices.values()):
-                self._drained.wait()
+            while any(device.in_flight for device in self._devices.values()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.log("WARN", "shutdown drain timed out; closing transports asynchronously")
+                    break
+                self._drained.wait(remaining)
         closer = threading.Thread(target=self._close_device, name="daemon-device-close", daemon=True)
         closer.start()
         closer.join(DRAIN_TIMEOUT_SECONDS)
+        if closer.is_alive():
+            self.log("WARN", "device close is still in progress after shutdown timeout")
         try:
             if os.path.lexists(self.socket_path):
                 os.unlink(self.socket_path)
@@ -654,13 +669,23 @@ class DaemonServer:
         self._stopped.set()
 
     def _close_device(self) -> None:
-        with self._lock:
-            states = {id(d.state): d.state for d in self._devices.values()}
-            if self.state is not None:
-                states[id(self.state)] = self.state
-        for state in states.values():
+        with self._drained:
+            devices = list(self._devices.values())
+            ready = []
+            for device in devices:
+                if device.in_flight:
+                    # Do not race driver I/O after the bounded shutdown deadline.
+                    # Its final operation completion owns the deferred close.
+                    device.close_when_idle = True
+                else:
+                    ready.append(device)
+            states = {id(device.state) for device in devices}
+            fallback = self.state if self.state is not None and id(self.state) not in states else None
+        for device in ready:
+            self._disconnect_device_after_drain(device)
+        if fallback is not None:
             try:
-                state.disconnect()
+                fallback.disconnect()
             except Exception as exc:
                 self.log("ERR", f"device close during shutdown failed: {exc!r}")
 
@@ -753,8 +778,11 @@ class DaemonServer:
                 self._grace_started = self.clock()
             count = len(self._clients)
             self._drained.notify_all()
+        deadline = (self._shutdown_deadline if self._shutting_down
+                    and self._shutdown_deadline is not None
+                    else time.monotonic() + DRAIN_TIMEOUT_SECONDS)
         for device in memberships:
-            self._leave_device(conn, device)
+            self._leave_device(conn, device, deadline=deadline)
         self._broadcast_count(count)
 
     def status(self, viewer: Connection | None = None) -> dict:
@@ -780,23 +808,70 @@ class DaemonServer:
             conn.send_event(frame)
 
     def _device_snapshots_locked(self) -> list[dict]:
-        return [
-            {"device_id": d.device_id, "port": d.port,
-             "state": "closing" if d.closing else "connected",
-             "baudrate": d.baudrate,
-             "control": "held" if d.controller is not None else "available",
-             "members": len(d.members), "generation": d.generation}
-            for d in self._devices.values()
-        ]
+        snapshots = []
+        for device in self._devices.values():
+            live = self._device_is_live_locked(device)
+            snapshots.append({
+                "device_id": device.device_id, "port": device.port,
+                "state": "closing" if device.closing else "connected" if live else "disconnected",
+                "baudrate": device.baudrate,
+                "control": "held" if live and device.controller is not None else "available",
+                "members": len(device.members), "generation": device.generation,
+            })
+        return snapshots
 
-    def _resolve_physical(self, port: str) -> tuple[tuple[int, int], str]:
+    def _resolve_physical(self, port: str) -> tuple[tuple[int, int], tuple[int, int, int, int]]:
         if not isinstance(port, str) or not port:
             raise ValueError("port must be a non-empty path")
         st = os.stat(port)
         if not stat.S_ISCHR(st.st_mode):
             raise ValueError("port is not a character device")
         identity = (os.major(st.st_rdev), os.minor(st.st_rdev))
-        return identity, ""
+        fingerprint = (st.st_dev, st.st_ino, st.st_rdev, st.st_ctime_ns)
+        return identity, fingerprint
+
+    @staticmethod
+    def _opened_node_fingerprint(device: Device) -> tuple[int, int, int, int] | None:
+        transport = device.state.transport
+        if transport is None or not transport.is_open:
+            return None
+        serial_handle = getattr(transport, "ser", None)
+        if serial_handle is None:
+            return None
+        try:
+            st = os.fstat(serial_handle.fileno())
+        except (OSError, ValueError):
+            return None
+        return st.st_dev, st.st_ino, st.st_rdev, st.st_ctime_ns
+
+    def _device_is_live_locked(self, device: Device) -> bool:
+        opened = self._opened_node_fingerprint(device)
+        if not device.online or opened is None or opened != device.node_fingerprint:
+            if device.online:
+                self._mark_device_disconnected_locked(device)
+            return False
+        for path in device.paths:
+            try:
+                identity, fingerprint = self._resolve_physical(path)
+            except (OSError, ValueError):
+                continue
+            if identity == device.identity and fingerprint == opened:
+                return True
+        self._mark_device_disconnected_locked(device)
+        return False
+
+    def _mark_device_disconnected_locked(self, device: Device) -> None:
+        if not device.online:
+            return
+        device.online = False
+        device.generation += 1
+        holder, device.controller = device.controller, None
+        device.idle_since = None
+        device.pending_release = False
+        if holder is not None:
+            holder.send_event({"event": "control_lost", "device_id": device.device_id,
+                               "port": device.port, "reason": "device_disconnected"})
+        self._broadcast_device_event("disconnected", device)
 
     # -- device output fan-out --------------------------------------------
 
@@ -820,28 +895,31 @@ class DaemonServer:
                 device.output_start_offset = _old_seq + len(old)
             self._drained.notify_all()
 
-    def _broadcast_device_event(self, state_name: str, device: Device | None = None) -> None:
+    def _broadcast_device_event(self, state_name: str, device: Device | None = None,
+                                *, all_clients: bool = False) -> None:
         frame = {"event": "device", "state": state_name}
         if device is not None:
             frame.update({"device_id": device.device_id, "port": device.port,
                           "baudrate": device.baudrate, "generation": device.generation})
-            with self._lock:
-                clients = list(device.members)
-        else:
-            with self._lock:
-                clients = list(self._clients)
+        with self._lock:
+            clients = (list(self._clients) if device is None or all_clients
+                       else list(device.members))
         for conn in clients:
             conn.send_event(frame)
     # -- device membership, control leases and tools -------------------------
 
     def _join_device(self, conn: Connection, port: str, baudrate: int | None, *, ai: bool) -> tuple[Device | None, dict | None]:
         try:
-            identity, device_id = self._resolve_physical(port)
+            identity, fingerprint = self._resolve_physical(port)
         except (OSError, ValueError) as exc:
             return None, {"code": "invalid_port", "message": str(exc)}
         if ai and (baudrate is None or isinstance(baudrate, bool)
                    or not isinstance(baudrate, int) or baudrate <= 0):
             return None, {"code": "bad_args", "message": "connect requires a positive integer baudrate"}
+        if baudrate is not None and (isinstance(baudrate, bool)
+                                     or not isinstance(baudrate, int) or baudrate <= 0):
+            return None, {"code": "bad_args", "message": "baudrate must be a positive integer"}
+
         with self._drained:
             if self._shutting_down:
                 return None, {"code": "shutting_down", "message": "the daemon is shutting down"}
@@ -856,31 +934,142 @@ class DaemonServer:
                         return None, {"code": "busy", "message": "device did not finish opening or closing in time"}
                     self._drained.wait(remaining)
                 device = self._devices.get(identity)
-            if device is not None:
+            if device is not None and device.node_fingerprint == fingerprint \
+                    and self._device_is_live_locked(device):
+                device.paths.add(port)
                 device.members.add(conn)
                 conn.memberships.add(device.device_id)
                 device.cursors.setdefault(conn, device.rx_offset)
                 if device.controller is conn:
                     device.idle_since = self.clock()
                 return device, None
-            if baudrate is None:
-                return None, {"code": "bad_args", "message": "baudrate is required when opening a device"}
-            if isinstance(baudrate, bool) or not isinstance(baudrate, int) or baudrate <= 0:
-                return None, {"code": "bad_args", "message": "baudrate must be a positive integer"}
-            device_id = f"d{next(self._device_ids)}"
-            state = self.state if not self._devices else SerialState(
-                log_path=str(self.runtime / f"serial-{device_id}.log"))
-            device = Device(device_id, identity, state, port, baudrate, active=1)
-            device.closing = True  # reserve identity while the driver open runs
-            device.rx_listener = lambda chunk, d=device: self._on_device_rx_for(d, chunk)
-            state.rx_listeners.append(device.rx_listener)
-            self._devices[identity] = device
+
+            candidate = device
+            if candidate is not None:
+                self._mark_device_disconnected_locked(candidate)
+            if candidate is None:
+                for item in self._devices.values():
+                    if port in item.paths:
+                        self._device_is_live_locked(item)
+                candidate = next((item for item in self._devices.values()
+                                  if port in item.paths and not item.online and not item.closing), None)
+            if candidate is not None:
+                collision = self._devices.get(identity)
+                if collision is not None and collision is not candidate:
+                    return None, {"code": "busy", "message": "the replacement tty is already owned by another device session"}
+                if candidate.closing or candidate.recovering:
+                    return None, {"code": "busy", "message": "device recovery is already in progress"}
+                candidate.closing = True
+                candidate.recovering = True
+                old_identity = candidate.identity
+                if old_identity != identity:
+                    if self._devices.get(old_identity) is candidate:
+                        del self._devices[old_identity]
+                    candidate.identity = identity
+                    self._devices[identity] = candidate
+                candidate.paths.add(port)
+                deadline = time.monotonic() + DRAIN_TIMEOUT_SECONDS
+                while candidate.in_flight:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        candidate.recovering = False
+                        candidate.closing = False
+                        candidate.identity = old_identity
+                        if self._devices.get(identity) is candidate:
+                            del self._devices[identity]
+                        self._devices[old_identity] = candidate
+                        self._drained.notify_all()
+                        return None, {"code": "busy", "message": "device operation did not settle before recovery"}
+                    self._drained.wait(remaining)
+                # Count the reconnect transaction so shutdown and membership
+                # cleanup see it as in-flight work while the engine is reopened.
+                candidate.active += 1
+                candidate.in_flight += 1
+                recovering = candidate
+            else:
+                if baudrate is None:
+                    return None, {"code": "bad_args", "message": "baudrate is required when opening a device"}
+                device_id = f"d{next(self._device_ids)}"
+                state = self.state if not self._devices else SerialState(
+                    log_path=str(self.runtime / f"serial-{device_id}.log"))
+                device = Device(device_id, identity, state, port, baudrate, active=1, in_flight=1,
+                                paths={port}, node_fingerprint=fingerprint)
+                device.closing = True  # reserve identity while the driver open runs
+                device.rx_listener = lambda chunk, d=device: self._on_device_rx_for(d, chunk)
+                state.rx_listeners.append(device.rx_listener)
+                self._devices[identity] = device
+                recovering = None
+
+        if recovering is not None:
+            device = recovering
+            state = device.state
+            try:
+                state.disconnect()
+                opened = state.connect(port=port, baudrate=device.baudrate, session_socket="")
+                if not isinstance(opened, str) or opened.startswith("Error"):
+                    raise OSError(opened if isinstance(opened, str) else "device reopen failed")
+                actual_identity = getattr(state.transport, "device_id", None)
+                actual_fingerprint = self._opened_node_fingerprint(device)
+                if (actual_identity is None
+                        or (os.major(actual_identity), os.minor(actual_identity)) != identity
+                        or actual_fingerprint != fingerprint):
+                    raise OSError("reopened tty identity changed while connecting")
+            except Exception as exc:
+                try:
+                    state.disconnect()
+                except Exception:
+                    pass
+                with self._drained:
+                    device.active = 0
+                    device.in_flight = 0
+                    device.online = False
+                    device.recovering = False
+                    device.closing = False
+                    if self._devices.get(identity) is device:
+                        del self._devices[identity]
+                    self._devices[old_identity] = device
+                    device.identity = old_identity
+                    self._drained.notify_all()
+                return None, {"code": "internal", "message": f"could not reopen device: {exc}"}
+            with self._drained:
+                device.port = port
+                device.node_fingerprint = actual_fingerprint
+                device.active = 0
+                device.in_flight = 0
+                device.online = True
+                device.recovering = False
+                device.closing = False
+                device.generation += 1
+                device.output.clear()
+                device.output_bytes = 0
+                device.output_start_offset = device.rx_offset
+                device.cursors = {member: device.rx_offset for member in device.members}
+                actual_baudrate = getattr(state.transport, "baudrate", device.baudrate)
+                if isinstance(actual_baudrate, int) and actual_baudrate > 0:
+                    device.baudrate = actual_baudrate
+                if conn.closed or self._shutting_down:
+                    cleanup = not device.members
+                else:
+                    device.members.add(conn)
+                    conn.memberships.add(device.device_id)
+                    device.cursors[conn] = device.rx_offset
+                    cleanup = False
+                self._drained.notify_all()
+            self._broadcast_device_event("open", device)
+            if cleanup:
+                self._leave_device(conn, device)
+                return None, {"code": "client_closed", "message": "client disconnected during recovery"}
+            return device, None
+
         try:
             opened = state.connect(port=port, baudrate=baudrate, session_socket="")
             if not isinstance(opened, str) or opened.startswith("Error"):
                 raise OSError(opened if isinstance(opened, str) else "device open failed")
             actual_identity = getattr(state.transport, "device_id", None)
-            if actual_identity is None or (os.major(actual_identity), os.minor(actual_identity)) != identity:
+            actual_fingerprint = self._opened_node_fingerprint(device)
+            if (actual_identity is None
+                    or (os.major(actual_identity), os.minor(actual_identity)) != identity
+                    or actual_fingerprint != fingerprint):
                 raise OSError("opened tty identity changed while connecting")
             actual_baudrate = getattr(state.transport, "baudrate", baudrate)
             if isinstance(actual_baudrate, int) and actual_baudrate > 0:
@@ -895,6 +1084,7 @@ class DaemonServer:
             finally:
                 with self._drained:
                     device.active = 0
+                    device.in_flight = 0
                     if self._devices.get(identity) is device:
                         del self._devices[identity]
                     self._drained.notify_all()
@@ -906,7 +1096,10 @@ class DaemonServer:
                 cleanup = True
             else:
                 device.active = 0
+                device.in_flight = 0
                 device.closing = False
+                device.online = True
+                device.node_fingerprint = actual_fingerprint
                 device.members.add(conn)
                 conn.memberships.add(device.device_id)
                 device.cursors[conn] = 0
@@ -923,13 +1116,16 @@ class DaemonServer:
             finally:
                 with self._drained:
                     device.active = 0
+                    device.in_flight = 0
                     if self._devices.get(identity) is device:
                         del self._devices[identity]
                     self._drained.notify_all()
             return None, {"code": "client_closed", "message": "client disconnected during join"}
+        self._broadcast_device_event("open", device)
         return device, None
 
-    def _leave_device(self, conn: Connection, device: Device) -> None:
+    def _leave_device(self, conn: Connection, device: Device,
+                      *, deadline: float | None = None) -> None:
         self._broadcast_device_event("left", device)
         with self._drained:
             device.members.discard(conn)
@@ -942,33 +1138,76 @@ class DaemonServer:
             if last_member:
                 device.closing = True
                 self._drained.notify_all()
-            while device.active:
-                self._drained.wait()
+            if device.recovering:
+                # The reconnect owner will either add its new membership or close
+                # the device when recovery completes; do not race its driver calls.
+                self._drained.notify_all()
+                return
+            if deadline is None:
+                deadline = (self._shutdown_deadline if self._shutting_down
+                            and self._shutdown_deadline is not None
+                            else time.monotonic() + DRAIN_TIMEOUT_SECONDS)
+            while device.in_flight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.log("WARN", f"device drain timed out while {conn.cid} was leaving")
+                    break
+                self._drained.wait(remaining)
+            timed_out = bool(device.in_flight)
             if device.controller is conn:
                 device.controller = None
                 device.idle_since = None
-                device.pending_release = False
+                device.pending_release = timed_out
             if not last_member:
                 return
-        try:
-            if device.rx_listener in device.state.rx_listeners:
-                device.state.rx_listeners.remove(device.rx_listener)
-            device.state.disconnect()
-        finally:
+        if device.rx_listener in device.state.rx_listeners:
+            device.state.rx_listeners.remove(device.rx_listener)
+        if timed_out:
+            # A transfer can explicitly refuse disconnect while it owns I/O.
+            # Defer physical teardown until the accepted operation releases it.
             with self._drained:
-                if self._devices.get(device.identity) is device:
-                    del self._devices[device.identity]
+                device.close_when_idle = True
                 self._drained.notify_all()
+            return
+        self._disconnect_device_after_drain(device)
+        with self._drained:
+            if self._devices.get(device.identity) is device:
+                del self._devices[device.identity]
+            self._drained.notify_all()
+
+    def _disconnect_device_after_drain(self, device: Device) -> None:
+        try:
+            device.state.disconnect()
+        except Exception as exc:
+            self.log("ERR", f"device close failed: {exc!r}")
+        transport = getattr(device.state, "transport", None)
+        if transport is None or not transport.is_open:
+            device.online = False
+            self._broadcast_device_event("closed", device, all_clients=True)
+        else:
+            self.log("WARN", f"device {device.device_id} refused close while I/O remained active")
 
     def _device_for_call(self, conn: Connection, port: str) -> Device | None:
         try:
-            identity, _ = self._resolve_physical(port)
+            identity, fingerprint = self._resolve_physical(port)
         except (OSError, ValueError):
-            return None
+            identity = None
+            fingerprint = None
         with self._lock:
-            device = self._devices.get(identity)
-            if device is not None and conn in device.members:
-                return device
+            if identity is not None:
+                device = self._devices.get(identity)
+                if device is not None and conn in device.members:
+                    if device.node_fingerprint != fingerprint:
+                        self._mark_device_disconnected_locked(device)
+                    else:
+                        self._device_is_live_locked(device)
+                    return device
+            # A vanished tty cannot be stat'ed, but disconnect must remain possible
+            # using the exact selector that originally joined this stale membership.
+            for device in self._devices.values():
+                if conn in device.members and port in device.paths:
+                    self._device_is_live_locked(device)
+                    return device
         return None
 
     def _check_device_control(self, conn: Connection, device: Device, modifying: bool) -> dict | None:
@@ -982,20 +1221,40 @@ class DaemonServer:
                 holder.send_event({"event": "control_lost", "device_id": device.device_id,
                                    "port": device.port, "reason": "expired"})
                 holder = None
-            if not modifying:
-                return None
-            if holder is not conn or device.pending_release:
-                if holder is None:
-                    return {"code": "control_required", "message": "call connect(port, baudrate) explicitly to acquire control"}
-                return {"code": "busy", "message": "device is controlled by another client"}
-            device.active += 1
+            if modifying:
+                if holder is not conn or device.pending_release:
+                    if holder is None:
+                        return {"code": "control_required", "message": "call connect(port, baudrate) explicitly to acquire control"}
+                    return {"code": "busy", "message": "device is controlled by another client"}
+                device.active += 1
+            device.in_flight += 1
             return None
 
-    def _end_device_operation(self, device: Device, conn: Connection) -> None:
+    def _end_device_operation(self, device: Device, conn: Connection,
+                              *, modifying: bool = True) -> None:
         with self._lock:
-            device.active = max(0, device.active - 1)
-            if device.active == 0 and device.controller is conn:
+            device.in_flight = max(0, device.in_flight - 1)
+            if modifying:
+                device.active = max(0, device.active - 1)
+            if modifying and device.active == 0 and device.controller is conn:
                 device.idle_since = self.clock()
+            if device.in_flight == 0 and device.pending_release and device.controller is None:
+                device.pending_release = False
+            close_now = device.in_flight == 0 and device.close_when_idle
+            if close_now:
+                device.close_when_idle = False
+            self._drained.notify_all()
+        if close_now:
+            closer = threading.Thread(
+                target=self._finish_deferred_close, args=(device,),
+                name=f"daemon-close-{device.device_id}", daemon=True)
+            closer.start()
+
+    def _finish_deferred_close(self, device: Device) -> None:
+        self._disconnect_device_after_drain(device)
+        with self._drained:
+            if self._devices.get(device.identity) is device:
+                del self._devices[device.identity]
             self._drained.notify_all()
 
     def run_call(self, conn: Connection, rid, tool: str, args: dict) -> None:
@@ -1023,7 +1282,7 @@ class DaemonServer:
                 conn.send_error(rid, error["code"], error["message"])
                 return
             with self._lock:
-                if device.controller is None:
+                if device.controller is None and not device.pending_release and device.active == 0:
                     device.controller = conn
                     device.idle_since = self.clock()
                 control = "granted" if device.controller is conn else "not_granted"
@@ -1032,7 +1291,7 @@ class DaemonServer:
                 result = {"result": f"Connected to {port} at {device.baudrate} baud.",
                           "device_id": device.device_id, "port": port, "baudrate": device.baudrate,
                           "control": control, "lease_remaining": remaining}
-            self._broadcast_device_event("connected", device)
+            self._broadcast_device_event("joined", device)
             conn.send_result(rid, result)
             return
         device = self._device_for_call(conn, port)
@@ -1045,7 +1304,9 @@ class DaemonServer:
                 return
             self._leave_device(conn, device)
             conn.send_result(rid, {"result": "Disconnected.", "device_id": device.device_id, "port": port})
-            self._broadcast_device_event("disconnected", device)
+            return
+        if not device.online or device.closing:
+            conn.send_error(rid, "not_connected", "the joined tty is no longer connected; reconnect or disconnect it")
             return
         modifying = tool not in ("read_output", "view_io")
         error = self._check_device_control(conn, device, modifying)
@@ -1056,8 +1317,10 @@ class DaemonServer:
             try:
                 result = self._read_device_output(conn, device, args)
             except Exception as exc:
+                self._end_device_operation(device, conn, modifying=False)
                 conn.send_error(rid, "bad_args", str(exc))
                 return
+            self._end_device_operation(device, conn, modifying=False)
             conn.send_result(rid, {"result": result, "device_id": device.device_id,
                                    "port": port, "generation": device.generation})
             return
@@ -1094,8 +1357,7 @@ class DaemonServer:
         try:
             bound = inspect.signature(method).bind(**call_args)
         except TypeError as exc:
-            if modifying:
-                self._end_device_operation(device, conn)
+            self._end_device_operation(device, conn, modifying=modifying)
             conn.send_error(rid, "bad_args", f"{tool}: {exc}")
             return
         start_generation = device.generation
@@ -1103,12 +1365,10 @@ class DaemonServer:
             text = method(*bound.args, **bound.kwargs)
         except Exception as exc:
             self.log("ERR", f"tool {tool} raised: {exc!r}")
-            if modifying:
-                self._end_device_operation(device, conn)
+            self._end_device_operation(device, conn, modifying=modifying)
             conn.send_error(rid, "internal", f"{tool} failed unexpectedly")
             return
-        if modifying:
-            self._end_device_operation(device, conn)
+        self._end_device_operation(device, conn, modifying=modifying)
         result = {"result": text if isinstance(text, str) else str(text),
                   "device_id": device.device_id, "port": port,
                   "generation": device.generation}
@@ -1184,14 +1444,13 @@ class DaemonServer:
             if device.closing or conn not in device.members:
                 return None, {"code": "not_member", "message": "join the device before writing"}
             device.active += 1
+            device.in_flight += 1
         try:
             if not device.state.human_write(data):
                 return None, {"code": "not_connected", "message": "no device is connected"}
             return {"written": len(data), "device_id": device.device_id}, None
         finally:
-            with self._drained:
-                device.active = max(0, device.active - 1)
-                self._drained.notify_all()
+            self._end_device_operation(device, conn)
 
 
 _FATAL_FRAME_CODES = frozenset({"frame_too_large", "unsupported_version"})

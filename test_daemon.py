@@ -7,12 +7,14 @@ this module injects a deterministic monotonic clock for lease expiry.
 import os
 import pty
 import socket
+import threading
 import time
 
 import pytest
 
+import serial_mcp_daemon as daemon_module
 import serial_mcp_ipc as ipc
-from serial_mcp_daemon import DaemonServer
+from serial_mcp_daemon import Connection, DaemonServer, Device
 from serial_mcp_engine import SerialState
 
 
@@ -81,6 +83,82 @@ def fake_tty():
     port = os.ttyname(slave)
     os.close(slave)  # the daemon must be the only process opening the slave
     return master, port
+
+
+def test_shutdown_bounds_inflight_operation_drain(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon_module, "DRAIN_TIMEOUT_SECONDS", 0.05)
+    disconnect_started = threading.Event()
+    allow_disconnect = threading.Event()
+
+    class StuckState:
+        def disconnect(self):
+            disconnect_started.set()
+            allow_disconnect.wait(2)
+
+        def _log(self, *_args):
+            pass
+
+    state = StuckState()
+    daemon = DaemonServer(runtime=tmp_path / "runtime", state=state,
+                          start_housekeeping=False)
+    device = Device("d1", (1, 1), state, "/dev/fake", 9600, active=1, in_flight=1)
+    daemon._devices[device.identity] = device
+
+    started = time.monotonic()
+    daemon.stop("test")
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 0.5
+        assert device.close_when_idle
+        assert not disconnect_started.is_set()
+        daemon._end_device_operation(device, None)
+        assert disconnect_started.wait(0.1)
+    finally:
+        allow_disconnect.set()
+
+
+def test_client_exit_bounds_device_drain(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon_module, "DRAIN_TIMEOUT_SECONDS", 0.05)
+    disconnect_started = threading.Event()
+    allow_disconnect = threading.Event()
+
+    class StuckState:
+        rx_listeners = []
+
+        def disconnect(self):
+            disconnect_started.set()
+            allow_disconnect.wait(2)
+
+        def _log(self, *_args):
+            pass
+
+    state = StuckState()
+    daemon = DaemonServer(runtime=tmp_path / "runtime", state=state,
+                          start_housekeeping=False)
+    left, right = socket.socketpair()
+    conn = Connection(daemon, left, "synthetic")
+    device = Device("d1", (1, 1), state, "/dev/fake", 9600, in_flight=1)
+    device.members.add(conn)
+    conn.memberships.add(device.device_id)
+    daemon._devices[device.identity] = device
+
+    started = time.monotonic()
+    try:
+        daemon._leave_device(conn, device)
+        assert time.monotonic() - started < 0.5
+        assert device.identity in daemon._devices
+        assert device.close_when_idle
+        daemon._end_device_operation(device, conn, modifying=False)
+        assert disconnect_started.wait(0.1)
+        allow_disconnect.set()
+        deadline = time.monotonic() + 0.5
+        while device.identity in daemon._devices and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert device.identity not in daemon._devices
+    finally:
+        allow_disconnect.set()
+        left.close()
+        right.close()
 
 
 def test_expired_control_requires_explicit_connect_and_never_auto_takes_over(live_daemon):

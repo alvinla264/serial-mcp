@@ -73,6 +73,15 @@ def open_pty():
     return master, os.ttyname(slave), slave
 
 
+def next_device_state(client, state, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        event = client.next_event(timeout=max(0.01, deadline - time.monotonic()))
+        if event and event.get("event") == "device" and event.get("state") == state:
+            return event
+    raise AssertionError(f"did not receive device state {state}")
+
+
 def test_two_devices_and_busy_join_are_independent(devices_runtime, tmp_path):
     m1, p1, s1 = open_pty()
     m2, p2, s2 = open_pty()
@@ -109,6 +118,74 @@ def test_two_devices_and_busy_join_are_independent(devices_runtime, tmp_path):
         a.close(); b.close()
         for fd in (m1, m2):
             os.close(fd)
+
+
+def test_replug_reopens_the_existing_device_instead_of_reporting_a_stale_connection(
+        devices_runtime, tmp_path):
+    old_master, old_port, old_slave = open_pty()
+    os.close(old_slave)
+    alias = str(tmp_path / "device")
+    os.symlink(old_port, alias)
+    client = connect_client(devices_runtime)
+    replacement_master = replacement_slave = None
+    try:
+        client.hello("mcp", "replug-test")
+        first = client.call("connect", {"port": alias, "baudrate": 115200})
+        device_id = first["device_id"]
+        next_device_state(client, "open")
+        next_device_state(client, "joined")
+        os.close(old_master)
+        old_master = -1
+        replacement_master, replacement_port, replacement_slave = open_pty()
+        os.close(replacement_slave)
+        replacement_slave = None
+        os.unlink(alias)
+        os.symlink(replacement_port, alias)
+
+        reopened = client.call("connect", {"port": alias, "baudrate": 57600})
+        next_device_state(client, "disconnected")
+        next_device_state(client, "open")
+        next_device_state(client, "joined")
+        assert reopened["device_id"] == device_id
+        assert reopened["baudrate"] == 115200  # first-open baud remains authoritative
+        assert reopened["control"] == "granted"
+        os.write(replacement_master, b"after-replug")
+        output = client.call("read_output", {"port": alias, "timeout": 2})
+        assert "after-replug" in output
+        devices = client.status()["devices"]
+        assert len(devices) == 1
+        assert devices[0]["state"] == "connected"
+    finally:
+        client.close()
+        for fd in (old_master, replacement_master, replacement_slave):
+            if fd is not None and fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def test_disconnect_succeeds_after_the_tty_path_disappears(devices_runtime, tmp_path):
+    master, port, slave = open_pty()
+    os.close(slave)
+    alias = str(tmp_path / "device")
+    os.symlink(port, alias)
+    client = connect_client(devices_runtime)
+    try:
+        client.hello("mcp", "vanish-test")
+        client.call("connect", {"port": alias, "baudrate": 115200})
+        os.close(master)
+        master = -1
+        wait_until(lambda: client.status()["devices"][0]["state"] == "disconnected")
+        result = client.call("disconnect", {"port": alias})
+        assert result["result"] == "Disconnected."
+        next_device_state(client, "left")
+        next_device_state(client, "closed")
+        assert client.status()["devices"] == []
+    finally:
+        client.close()
+        if master >= 0:
+            os.close(master)
 
 
 def test_baud_change_during_active_command_is_allowed_and_warns(devices_runtime):
