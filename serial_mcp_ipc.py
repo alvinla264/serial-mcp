@@ -1,4 +1,4 @@
-"""Shared daemon IPC primitives for serial-mcp (protocol v1).
+"""Shared daemon IPC primitives for serial-mcp (protocol v2).
 
 This module is deliberately stdlib-only and must not import ``server`` (which
 constructs device state and imports FastMCP). Frontends import it to discover,
@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Contract constants (docs/daemon-ipc.md section 11). Changing any of these is a
 # protocol change.

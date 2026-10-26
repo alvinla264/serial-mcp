@@ -1,4 +1,4 @@
-"""Per-user shared serial daemon (protocol v1, docs/daemon-ipc.md).
+"""Per-user shared serial daemon (protocol v2, docs/daemon-ipc.md).
 
 The daemon owns the single device connection (a ``SerialState``), its background
 reader, buffers, and the device operations. Clients connect over a permission-
@@ -55,7 +55,7 @@ from serial_mcp_ipc import (
     encode_frame,
 )
 
-DAEMON_VERSION = "0.2.0"
+DAEMON_VERSION = "0.3.0"
 MAX_CLIENT_NAME = 64
 ROLES = ("mcp", "human")
 
