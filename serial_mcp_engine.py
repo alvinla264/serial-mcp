@@ -419,8 +419,9 @@ class SerialState:
                 if actual is not None:
                     transport.baudrate = actual
                 return f"Error: could not set baudrate ({exc}); actual baudrate is {actual}."
-            transport.baudrate = baudrate
-            return f"Baudrate set to {baudrate}."
+            actual = getattr(serial_handle, "baudrate", baudrate)
+            transport.baudrate = actual
+            return f"Baudrate set to {actual}."
 
     def _reader_loop(self) -> None:
         while not self.stop_event.is_set():

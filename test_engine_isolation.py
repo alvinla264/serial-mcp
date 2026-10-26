@@ -192,30 +192,24 @@ def test_daemon_entry_point_starts_and_serves_without_mcp_framework(daemon_run):
     try:
         hello = mcp.hello(role="mcp", name="ai-test")
         assert hello["role"] == "mcp"
-        assert mcp.status()["device"] is None
-
-        assert "not connected" in mcp.call("tio_info", {}).lower()
+        assert mcp.status()["devices"] == []
         assert mcp.call("file_transfer_capabilities", {}) == _engine_caps()
 
-        connected = mcp.call("connect", {"port": device.port, "session_socket": ""}, timeout=30)
-        assert "Connected" in connected
-        reply = mcp.call("send_command", {"text": "PING", "terminator_regex": "END"}, timeout=30)
+        connected = mcp.call("connect", {"port": device.port, "baudrate": 115200}, timeout=30)
+        assert connected["control"] == "granted"
+        reply = mcp.call("send_command", {"port": device.port, "text": "PING",
+                                           "terminator_regex": "END"}, timeout=30)
         assert "pong" in reply and "END" in reply
-        assert "PING" in mcp.call("view_io", {"lines": 20})
-
-        # The connect call acquired the lease for this client; release, then re-acquire.
-        released = mcp.lease("release")
-        assert released["state"] == "free" and released["holder"] is None
-        acquired = mcp.lease("acquire")
-        assert acquired["holder"]["client_id"] == hello["client_id"]
-        assert acquired["you"] == "holder"
+        assert "PING" in mcp.call("view_io", {"port": device.port, "lines": 20})
 
         human = ipc.DaemonClient.connect(path=rt / "daemon.sock", timeout=5)
         human.hello(role="human", name="term-test")
-        assert human.human_input(b"PING\n") == {"written": 5}
+        human.join(device.port)
+        assert human.human_input(b"PING\n", device.port)["written"] == 5
 
-        mcp.call("disconnect", {}, timeout=30)
-        assert mcp.status()["device"] is None
+        mcp.call("disconnect", {"port": device.port}, timeout=30)
+        human.leave(device.port)
+        assert mcp.status()["devices"] == []
     finally:
         if human is not None:
             human.close()

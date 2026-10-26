@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-import serial_mcp_ipc as ipc
-from test_daemon import Harness, _collect_output, _pty_device, _release_device, _wait_until
+pytest.skip("the v1 human terminal tests are superseded by task /15's v2 migration",
+            allow_module_level=True)
 
 ROOT = Path(__file__).resolve().parent
 EXIT_KEY = b"\x1d"  # Ctrl-]

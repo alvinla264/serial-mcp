@@ -36,6 +36,7 @@ SLOW_CONSUMER_TIMEOUT_SECONDS = 5
 MAX_SUBSCRIBER_QUEUE_BYTES = 256 * 1024
 MAX_OUTPUT_EVENT_BYTES = 16 * 1024
 MAX_INFLIGHT_CALLS_PER_CONNECTION = 8
+MAX_CLIENT_EVENT_QUEUE = 256
 MAX_HUMAN_INPUT_BYTES = 64 * 1024
 MAX_SPAWN_ATTEMPTS = 3
 LOCK_PROBE_WAIT_SECONDS = 0.5  # how long a daemon waits for daemon.lock (starter probes hold it for microseconds)
@@ -210,7 +211,7 @@ class DaemonClient:
         self._send_lock = threading.Lock()
         self._waiters: dict = {}
         self._waiters_lock = threading.Lock()
-        self._events: "queue.Queue[dict]" = queue.Queue()
+        self._events: "queue.Queue[dict]" = queue.Queue(maxsize=MAX_CLIENT_EVENT_QUEUE)
         self._next_id = 0
         self._closed = False
         self._close_reason: str | None = None
@@ -273,8 +274,13 @@ class DaemonClient:
             raise DaemonError(error.get("code", "internal"), error.get("message", ""), error)
         return reply.get("result") or {}
 
-    def call(self, tool: str, args: dict | None = None, timeout: float = 120.0) -> str:
-        return self.request("call", timeout=timeout, tool=tool, args=args or {})["result"]
+    def call(self, tool: str, args: dict | None = None, timeout: float = 120.0):
+        result = self.request("call", timeout=timeout, tool=tool, args=args or {})
+        # These v2 operations return structured control/settings metadata;
+        # ordinary text tools retain the established text convenience result.
+        if tool in {"connect", "disconnect", "set_baudrate"} or "warning" in result:
+            return result
+        return result.get("result", "")
 
     def lease(self, action: str) -> dict:
         return self.request("lease", action=action)
@@ -282,14 +288,27 @@ class DaemonClient:
     def status(self) -> dict:
         return self.request("status")
 
-    def subscribe(self) -> dict:
-        return self.request("subscribe")
+    def subscribe(self, port: str) -> dict:
+        return self.request("subscribe", port=port)
 
-    def unsubscribe(self) -> dict:
-        return self.request("unsubscribe")
+    def unsubscribe(self, port: str) -> dict:
+        return self.request("unsubscribe", port=port)
 
-    def human_input(self, data: bytes) -> dict:
-        return self.request("input", data=base64.b64encode(data).decode("ascii"))
+    def join(self, port: str, baudrate: int | None = None) -> dict:
+        fields = {"port": port}
+        if baudrate is not None:
+            fields["baudrate"] = baudrate
+        return self.request("join", **fields)
+
+    def leave(self, port: str) -> dict:
+        return self.request("leave", port=port)
+
+    def list_ports(self) -> dict:
+        return self.request("ports")
+
+    def human_input(self, data: bytes, port: str) -> dict:
+        return self.request("input", port=port,
+                            data=base64.b64encode(data).decode("ascii"))
 
     def next_event(self, timeout: float = 5.0) -> dict | None:
         try:
@@ -310,6 +329,29 @@ class DaemonClient:
         except OSError:
             pass
 
+    def _queue_event(self, frame: dict) -> None:
+        try:
+            self._events.put_nowait(frame)
+            return
+        except queue.Full:
+            pass
+        dropped_count = 0
+        dropped_device = None
+        while self._events.qsize() > MAX_CLIENT_EVENT_QUEUE - 2:
+            try:
+                dropped = self._events.get_nowait()
+            except queue.Empty:
+                break
+            dropped_count += dropped.get("dropped_events", 1) if dropped.get("event") == "event_gap" else 1
+            dropped_device = dropped.get("device_id", dropped_device)
+        marker = {"event": "event_gap", "dropped_events": dropped_count,
+                  "device_id": frame.get("device_id", dropped_device),
+                  "reason": "client event queue overflow; refresh status/output"}
+        # Keep both a visible loss marker and the newest event. Eviction is
+        # non-blocking so a stalled frontend cannot stop IPC response handling.
+        self._events.put_nowait(marker)
+        self._events.put_nowait(frame)
+
     def _drop_waiter(self, rid) -> None:
         with self._waiters_lock:
             self._waiters.pop(rid, None)
@@ -321,7 +363,7 @@ class DaemonClient:
                 if frame is None:
                     break
                 if "event" in frame:
-                    self._events.put(frame)
+                    self._queue_event(frame)
                     continue
                 with self._waiters_lock:
                     slot = self._waiters.pop(frame.get("id"), None)
@@ -341,7 +383,7 @@ class DaemonClient:
                 self._waiters.clear()
             for slot in waiters:
                 slot.event.set()
-            self._events.put({"event": "closed"})
+            self._queue_event({"event": "closed"})
 
 
 class _Waiter:

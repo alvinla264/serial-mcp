@@ -29,6 +29,7 @@ import tty
 import serial_mcp_ipc as ipc
 
 TERMINAL_VERSION = "0.2.0"
+TERMINAL_PROTOCOL_VERSION = 1
 CLIENT_NAME = "human-terminal"
 EXIT_KEY = 0x1D  # Ctrl-]: handled locally, never forwarded to the device
 INPUT_TIMEOUT_SECONDS = 10.0
@@ -235,9 +236,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         hello = client.hello(role="human", name=CLIENT_NAME, pid=os.getpid(), client_version=TERMINAL_VERSION)
+        if hello.get("protocol") != TERMINAL_PROTOCOL_VERSION:
+            raise RuntimeError(
+                f"daemon protocol {hello.get('protocol')!r} is incompatible; this terminal speaks "
+                f"{TERMINAL_PROTOCOL_VERSION}. Upgrade the terminal for daemon protocol v2."
+            )
         client.subscribe()
         device = client.status().get("device")
-    except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError) as exc:
+    except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError, RuntimeError) as exc:
         client.close()
         print(f"serial-mcp-terminal: the daemon refused this connection: {exc}", file=sys.stderr)
         return 1

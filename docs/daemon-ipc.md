@@ -80,10 +80,13 @@ First request is `hello`:
   `output_gap {device_id,dropped_bytes,seq}` explicitly signals bounded queue loss.
 - `input {port,data}` is human-role only, writes raw bytes immediately to the
   selected connected device independent of AI membership/control/operations.
-  It never takes or renews a lease. `join {port,baudrate?}` and `leave {port}`
-  are human-role internal operations. Join opens if absent (baud required then),
+  It never takes or renews a lease and returns `{written,device_id}`. `join
+  {port,baudrate?}` and `leave {port}` are human-role internal operations. Join
+  opens if absent (baud required then),
   otherwise joins at actual baud; neither grants AI control. Leave removes only
-  that human membership. `bye {}` responds then closes.
+  that human membership.
+- `ports {}` is human-role-only and returns `{result:<engine port listing>}` for
+  selection; it does not open a port. `bye {}` responds then closes.
 
 AI tools include `send_command`, `read_output`, `clear_output`,
 `set_prompt_pattern`, `login`, `enter_bootloader`, `upload_file`,
@@ -122,13 +125,18 @@ affected; do not infer success or failure from the warning.
 
 ## Events, cursors and backpressure
 
-Events: `settings` (accepted baud change), `device` (joined/left/open/closed,
+Events: `settings` (accepted baud change), `settings_gap` (coalesced/evicted settings), `device` (joined/left/open/closed,
 with snapshot-safe fields), `output`, `output_gap`, `control_lost`, `clients`
-(count only), and `shutdown`. Events are not authorization. MCP clients retain
+(count only), `event_gap` (local client event queue overflow), and `shutdown`.
+Events are not authorization. MCP clients retain
 settings notices in a bounded per-device queue and prepend notices to the next
 response for that device; TUI updates its view promptly. No model-wakeup promise.
-Queues are bounded; overflow must emit a visible coalesced/dropped notice or
-explicit gap, never silently claim complete output/settings history. Output
+Queues are bounded; the server caps pending control responses at 64 per client
+(closing a non-reading client on overflow), retains at most 32 pending per-device
+settings notices (emitting `settings_gap` when coalescing or evicting), and the
+stdlib client's local event queue is capped at 256 events with `event_gap` on
+overflow. Other frontends must likewise emit a visible coalesced/dropped notice
+or explicit gap, never silently claim complete output/settings history. Output
 sequence offsets are per physical device and monotonic for its open lifetime;
 each client cursor is independent. `generation` increases on accepted settings
 changes and new physical opens. A cursor is scoped to `(device_id,generation)`;
@@ -139,7 +147,8 @@ reopen invalidates prior-generation cursor explicitly.
 `hello_required`, `already_hello`, `bad_request`, `unsupported_version`,
 `frame_too_large`, `unknown_op`, `unknown_tool`, `invalid_port`, `not_connected`,
 `not_member`, `control_required`, `busy`, `overloaded`, `too_large`,
-`result_too_large`, `forbidden_role`, `shutting_down`, `bad_args`, `internal`.
+`result_too_large`, `forbidden_role`, `shutting_down`, `bad_args`, `internal`,
+`client_closed`, and `baudrate_rejected` (includes actual `baudrate`).
 Error result is `{code,message,...}`; no controller identity is returned.
 A transport failure after a modifying request has been accepted but before its
 response is received has **unknown outcome**. Clients must not replay. They may
