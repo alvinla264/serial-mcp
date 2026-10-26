@@ -65,8 +65,9 @@ First request is `hello`:
 - `disconnect {port}` leaves this caller's membership. If caller holds control,
   active operation settles before release. Other members/connections are kept.
   Last member departure marks closing, safely settles and closes the physical
-  port; joins racing close either join the retained device or create a fresh
-  one after close. Reopen selects a new baud.
+  port; joins racing close wait up to the bounded drain interval, then either
+  join the retained device or create a fresh one after close. A drain timeout
+  returns `busy`, and the caller may retry. Reopen selects a new baud.
 - `lease {action:"status",port}` is an internal status operation only and
   returns `{state,expires_in,active_operations,generation,you}` without identity.
   Public lease acquire/release is removed. Control can be acquired/reacquired
