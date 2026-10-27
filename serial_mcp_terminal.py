@@ -50,7 +50,10 @@ def _baud_input(fd: int, out_fd: int, err_fd: int) -> int | None:
                 except (ValueError, UnicodeDecodeError):
                     _write(err_fd, "Invalid baud rate.\r\n")
                     return None
-                return baud if 1 <= baud <= 4_000_000 else None
+                if not 1 <= baud <= 4_000_000:
+                    _write(err_fd, "Invalid baud rate; enter a value from 1 to 4000000.\r\n")
+                    return None
+                return baud
             if byte in (8, 127):
                 if chars:
                     chars.pop()

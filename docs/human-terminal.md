@@ -14,7 +14,7 @@ python -m serial_mcp_terminal
 nix run .#terminal
 ```
 
-Run from a real terminal (stdin must be a tty). The app starts or joins the per-user daemon. Use Up/Down or j/k to choose a port, Enter to join, and `q` or Ctrl-Q to quit from the list. An unopened port prompts for baud; an already-open device is joined at its actual baud without prompting or reconfiguration. The registered MCP count includes idle clients. No client names/IDs or controller identity are displayed.
+Run from a real terminal (stdin must be a tty). The app starts or joins the per-user daemon. Use Up/Down or j/k to choose a port, Enter to join, and `q` or Ctrl-Q to quit from the list. An unopened port prompts for baud (an integer from 1 through 4,000,000); malformed or out-of-range input is rejected. An already-open device is joined at its actual baud without prompting or reconfiguration. The registered MCP count includes idle clients. No client names/IDs or controller identity are displayed.
 
 | Input | Action |
 |---|---|
