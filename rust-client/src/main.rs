@@ -10,7 +10,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::{
@@ -29,11 +29,11 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 
-const PROTOCOL: u64 = 1;
+const PROTOCOL: u64 = 2;
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 const CALL_WAIT: Duration = Duration::from_secs(1860);
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const REACQUIRE_WARNING: &str = "control was lost; device state may have changed since you last used it. Call lease_acquire explicitly before using the device again. Requests are never retried automatically.";
+const REACQUIRE_WARNING: &str = "control was lost or expired; call connect(port, baudrate) explicitly to request control again. Requests are never retried automatically.";
 const CATALOG: &str = include_str!("../tools.json");
 
 fn read_daemon_line(
@@ -139,9 +139,8 @@ fn validate_args(schema: &Value, args: &Value) -> Result<(), String> {
 struct Frontend {
     client: Arc<Mutex<Option<Arc<Daemon>>>>,
     connect_lock: Arc<Mutex<()>>,
-    held: Arc<AtomicBool>,
-    reacquire: Arc<AtomicBool>,
-    notices: Arc<Mutex<Vec<String>>>,
+    notices: Arc<Mutex<HashMap<String, std::collections::VecDeque<String>>>>,
+    port_devices: Arc<Mutex<HashMap<String, String>>>,
 }
 
 struct Daemon {
@@ -158,9 +157,8 @@ impl Frontend {
         Self {
             client: Arc::new(Mutex::new(None)),
             connect_lock: Arc::new(Mutex::new(())),
-            held: Arc::new(AtomicBool::new(false)),
-            reacquire: Arc::new(AtomicBool::new(false)),
-            notices: Arc::new(Mutex::new(Vec::new())),
+            notices: Arc::new(Mutex::new(HashMap::new())),
+            port_devices: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -204,49 +202,114 @@ impl Frontend {
         let mut slot = self.client.lock().unwrap();
         if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, client)) {
             *slot = None;
-            if self.held.swap(false, Ordering::SeqCst) {
-                self.reacquire.store(true, Ordering::SeqCst);
-                self.notice(REACQUIRE_WARNING);
+            self.port_devices.lock().unwrap().clear();
+            self.notices.lock().unwrap().clear();
+        }
+    }
+
+    fn notice(&self, device_id: &str, text: &str) {
+        let mut notices = self.notices.lock().unwrap();
+        let queue = notices.entry(device_id.to_owned()).or_default();
+        if queue.iter().any(|item| item == text) {
+            return;
+        }
+        if queue.len() >= 32 {
+            while queue.len() > 30 {
+                queue.pop_front();
+            }
+            if !queue.iter().any(|item| item.contains("notices coalesced")) {
+                queue.push_front(
+                    "settings notices coalesced; one or more updates were omitted".into(),
+                );
             }
         }
+        queue.push_back(text.to_owned());
     }
 
-    fn notice(&self, text: &str) {
-        let mut n = self.notices.lock().unwrap();
-        if n.len() < 20 && !n.iter().any(|x| x == text) {
-            n.push(text.to_owned());
-        }
-    }
-
-    fn prefix(&self, text: String) -> String {
+    fn prefix(&self, port: Option<&str>, text: String) -> String {
+        let Some(device_id) =
+            port.and_then(|port| self.port_devices.lock().unwrap().get(port).cloned())
+        else {
+            return text;
+        };
         let mut notices = self.notices.lock().unwrap();
-        if notices.is_empty() {
+        let Some(queue) = notices.get_mut(&device_id) else {
+            return text;
+        };
+        if queue.is_empty() {
             return text;
         }
-        let prefix = notices
+        let prefix = queue
             .drain(..)
             .map(|n| format!("NOTICE: {n}\n"))
             .collect::<String>();
+        notices.remove(&device_id);
         format!("{prefix}\n{text}")
     }
 
     fn drain_events(&self, client: &Arc<Daemon>) -> bool {
         let events = std::mem::take(&mut *client.events.lock().unwrap());
         for event in events {
-            match event.get("event").and_then(Value::as_str) {
-                Some("lease_lost") => {
-                    self.held.store(false, Ordering::SeqCst);
-                    self.reacquire.store(true, Ordering::SeqCst);
-                    self.notice(event.get("warning").and_then(Value::as_str).unwrap_or(REACQUIRE_WARNING));
+            let event_name = event.get("event").and_then(Value::as_str).unwrap_or("");
+            let device_id = event.get("device_id").and_then(Value::as_str).unwrap_or("");
+            match event_name {
+                "settings" if !device_id.is_empty() => {
+                    let baudrate = event
+                        .get("baudrate")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    self.notice(
+                        device_id,
+                        &format!("settings changed: baudrate is now {baudrate}"),
+                    );
                 }
-                Some("shutdown") => self.notice(&format!("the serial-mcp daemon is shutting down ({}); the next tool call starts a new one", event.get("reason").and_then(Value::as_str).unwrap_or("unknown"))),
+                "settings_gap" if !device_id.is_empty() => self.notice(
+                    device_id,
+                    "settings notices coalesced; one or more updates were omitted",
+                ),
+                "control_lost" if !device_id.is_empty() => {
+                    self.notice(device_id, REACQUIRE_WARNING)
+                }
+                "event_gap" => {
+                    let devices = self
+                        .port_devices
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    for device_id in devices {
+                        self.notice(
+                            &device_id,
+                            "daemon event queue overflow; some events may be missing",
+                        );
+                    }
+                }
+                "shutdown" => {
+                    let devices = self
+                        .port_devices
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    for device_id in devices {
+                        self.notice(&device_id, &format!("the serial-mcp daemon is shutting down ({}); the next tool call starts a new one", event.get("reason").and_then(Value::as_str).unwrap_or("unknown")));
+                    }
+                }
                 _ => {}
             }
         }
         !client.closed.load(Ordering::SeqCst)
     }
 
-    fn refusal_text(&self, what: &str, error: &str) -> String {
+    fn refusal_text(
+        &self,
+        what: &str,
+        error: &str,
+        port: Option<&str>,
+        requested_baudrate: Option<u64>,
+    ) -> String {
         let parsed = error
             .strip_prefix("daemon error:")
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
@@ -261,50 +324,95 @@ impl Frontend {
             .and_then(Value::as_str)
             .unwrap_or("request failed");
         let mut text = format!("{what} was refused by the serial-mcp daemon ({code}): {message}");
-        if let Some(lease) = parsed.as_ref().and_then(|v| v.get("lease")) {
-            text.push_str(&format!(
-                " Lease: {}",
-                serde_json::to_string(lease).unwrap_or_default()
-            ));
+        if code == "baudrate_rejected" {
+            if let Some(actual) = parsed
+                .as_ref()
+                .and_then(|v| v.get("baudrate"))
+                .and_then(Value::as_u64)
+            {
+                text.push_str(&format!(
+                    " Requested baudrate: {}. Actual baudrate remains {actual}.",
+                    requested_baudrate.map_or_else(|| "unknown".into(), |rate| rate.to_string())
+                ));
+            }
         }
-        if code == "lease_lost" {
-            text.push_str(&format!(" {REACQUIRE_WARNING}"));
-        }
-        self.prefix(text)
+        self.prefix(port, text)
     }
 
     fn call(&self, name: &str, args: Value) -> Result<String, String> {
+        let port = args.get("port").and_then(Value::as_str).map(str::to_owned);
+        let requested_baudrate = matches!(name, "connect" | "set_baudrate")
+            .then(|| args.get("baudrate").and_then(Value::as_u64))
+            .flatten();
         let client = self.daemon()?;
         self.drain_events(&client);
-        if GATED.contains(&name) && self.reacquire.load(Ordering::SeqCst) {
-            return Err(self.prefix(format!("{name} refused: lease_lost. {REACQUIRE_WARNING}")));
-        }
         match client.request(json!({"op":"call","tool":name,"args":args}), CALL_WAIT) {
             Ok(v) => {
                 self.drain_events(&client);
-                if GATED.contains(&name) && !self.reacquire.load(Ordering::SeqCst) {
-                    self.held.store(true, Ordering::SeqCst);
+                let mut text = v
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if name == "set_baudrate" {
+                    if let Some(actual) = v.get("baudrate").and_then(Value::as_u64) {
+                        text.push_str(&format!(
+                            " Baudrate change accepted; actual baudrate is {actual}."
+                        ));
+                    }
                 }
-                Ok(self.prefix(
-                    v.get("result")
+                if name == "connect" {
+                    let control = v
+                        .get("control")
                         .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                ))
+                        .unwrap_or("not_granted");
+                    let actual = v
+                        .get("baudrate")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    let requested = requested_baudrate;
+                    if control == "not_granted" {
+                        text.push_str(&format!(
+                            " Control not granted; joined read-only at actual baudrate {actual}."
+                        ));
+                    } else {
+                        text.push_str(" Control granted.");
+                    }
+                    if let Some(requested) = requested.filter(|requested| *requested != actual) {
+                        text.push_str(&format!(" Requested baudrate {requested} differs; the open device remains at {actual}."));
+                    }
+                    if let Some(remaining) = v.get("lease_remaining").and_then(Value::as_f64) {
+                        text.push_str(&format!(" Remaining control lease: {remaining:.1}s."));
+                    }
+                }
+                if let Some(warning) = v.get("warning").and_then(Value::as_str) {
+                    text.push_str(&format!("\nWARNING: {warning}"));
+                }
+                if name == "connect" {
+                    if let (Some(port), Some(device_id)) =
+                        (port.as_ref(), v.get("device_id").and_then(Value::as_str))
+                    {
+                        self.port_devices
+                            .lock()
+                            .unwrap()
+                            .insert(port.clone(), device_id.to_owned());
+                    }
+                }
+                let text = self.prefix(port.as_deref(), text);
+                if name == "disconnect" {
+                    if let Some(port) = port.as_ref() {
+                        self.port_devices.lock().unwrap().remove(port);
+                    }
+                }
+                Ok(text)
             }
             Err(e) if e.starts_with("daemon error:") => {
                 self.drain_events(&client);
-                Err(self.refusal_text(name, &e))
+                Err(self.refusal_text(name, &e, port.as_deref(), requested_baudrate))
             }
             Err(e) => {
-                if GATED.contains(&name) {
-                    self.held.store(true, Ordering::SeqCst);
-                    self.reacquire.store(true, Ordering::SeqCst);
-                    self.notice(REACQUIRE_WARNING);
-                    self.held.store(false, Ordering::SeqCst);
-                }
                 self.connection_ended(&client);
-                Err(self.prefix(format!("the connection to the serial-mcp daemon ended while {name} was running ({e}). The device may or may not have acted on it. The call was not retried; check the device state before calling again.")))
+                Err(self.prefix(port.as_deref(), format!("the connection to the serial-mcp daemon ended while {name} was running ({e}). The device may or may not have acted on it. The call was not retried; check the device state before calling again.")))
             }
         }
     }
@@ -314,57 +422,7 @@ impl Frontend {
             client.close();
         }
     }
-
-    fn lease(&self, action: &str) -> Result<String, String> {
-        let client = self.daemon()?;
-        self.drain_events(&client);
-        let mut value = client
-            .request(
-                json!({"op":"lease","action":action}),
-                Duration::from_secs(10),
-            )
-            .map_err(|e| {
-                if e.starts_with("daemon error:") {
-                    self.drain_events(&client);
-                    self.refusal_text(&format!("lease {action}"), &e)
-                } else {
-                    self.connection_ended(&client);
-                    self.prefix(format!("lease {action} failed: {e}"))
-                }
-            })?;
-        let had_reacquire = self.reacquire.load(Ordering::SeqCst);
-        if action == "acquire" {
-            self.reacquire.store(false, Ordering::SeqCst);
-            self.held.store(true, Ordering::SeqCst);
-        }
-        if action == "release" {
-            self.held.store(false, Ordering::SeqCst);
-            self.reacquire.store(true, Ordering::SeqCst);
-        }
-        if action == "acquire" && had_reacquire && value.get("warning").is_none() {
-            value["warning"] = json!(REACQUIRE_WARNING);
-        }
-        let mut notices = self.notices.lock().unwrap();
-        if !notices.is_empty() {
-            value["notices"] = json!(notices.drain(..).collect::<Vec<_>>());
-        }
-        Ok(serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()))
-    }
 }
-
-const GATED: &[&str] = &[
-    "connect",
-    "attach",
-    "disconnect",
-    "send_command",
-    "read_output",
-    "clear_output",
-    "set_prompt_pattern",
-    "login",
-    "enter_bootloader",
-    "upload_file",
-    "download_file",
-];
 
 impl Daemon {
     fn from_stream(stream: UnixStream, child: Option<Child>) -> Result<Arc<Self>, String> {
@@ -429,6 +487,14 @@ impl Daemon {
                         }
                         break;
                     }
+                    let unsupported = frame.get("error").and_then(|error| error.get("code")).and_then(Value::as_str) == Some("unsupported_version");
+                    if unsupported {
+                        if let Some(this) = weak.upgrade() {
+                            let message = format!("daemon protocol mismatch: this frontend speaks protocol {PROTOCOL}; the daemon rejected that version: {}", frame["error"]["message"].as_str().unwrap_or("unsupported protocol"));
+                            for (_, tx) in this.pending.lock().unwrap().drain() { let _ = tx.send(Err(message.clone())); }
+                        }
+                        break;
+                    }
                     let Some(this) = weak.upgrade() else { return };
                     if let Some(id) = frame.get("id").and_then(Value::as_u64) {
                         if let Some(tx) = this.pending.lock().unwrap().remove(&id) {
@@ -447,9 +513,17 @@ impl Daemon {
                         }
                     } else if frame.get("event").is_some() {
                         let mut events = this.events.lock().unwrap();
-                        if events.len() < 64 {
-                            events.push(frame);
+                        if events.len() >= 63 {
+                            if let Some(gap) = events.iter_mut().find(|event| event["event"] == "event_gap") {
+                                let dropped = gap["dropped_events"].as_u64().unwrap_or(1) + 1;
+                                gap["dropped_events"] = json!(dropped);
+                            } else {
+                                if events.len() >= 63 { events.remove(0); }
+                                events.push(json!({"event":"event_gap","dropped_events":1}));
+                            }
+                            if events.len() >= 64 { events.remove(0); }
                         }
+                        events.push(frame);
                     }
                 }
                 if let Some(this) = weak.upgrade() {
@@ -695,28 +769,6 @@ impl McpServer {
                             ContentBlock::text(format!("Invalid arguments: {error}")),
                         ])));
                     }
-                    if tool_name.starts_with("lease_") {
-                        let action = match tool_name.as_str() {
-                            "lease_acquire" => "acquire",
-                            "lease_release" => "release",
-                            _ => "status",
-                        };
-                        return match tokio::task::spawn_blocking(move || f.lease(action)).await {
-                            Ok(Ok(text)) => {
-                                Ok(CallToolResponse::from(CallToolResult::success(vec![
-                                    ContentBlock::text(text),
-                                ])))
-                            }
-                            Ok(Err(text)) => {
-                                Ok(CallToolResponse::from(CallToolResult::error(vec![
-                                    ContentBlock::text(text),
-                                ])))
-                            }
-                            Err(e) => Ok(CallToolResponse::from(CallToolResult::error(vec![
-                                ContentBlock::text(e.to_string()),
-                            ]))),
-                        };
-                    }
                     match tokio::task::spawn_blocking(move || f.call(&tool_name, args)).await {
                         Ok(Ok(text)) => Ok(CallToolResponse::from(CallToolResult::success(vec![
                             ContentBlock::text(text),
@@ -811,51 +863,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_catalog_has_the_python_frontend_tool_set_and_validates_arguments() {
+    fn bundled_catalog_matches_the_shared_daemon_v2_surface_and_validates_arguments() {
         let tools: Vec<Value> = serde_json::from_str(CATALOG).unwrap();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 16);
         let names: Vec<_> = tools
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        for expected in [
-            "connect",
-            "upload_file",
-            "download_file",
+        for expected in ["connect", "upload_file", "download_file", "set_baudrate"] {
+            assert!(names.contains(&expected));
+        }
+        for removed in [
+            "attach",
+            "tio_info",
             "lease_acquire",
             "lease_release",
             "lease_status",
         ] {
-            assert!(names.contains(&expected));
+            assert!(!names.contains(&removed));
+        }
+        for item in &tools {
+            let name = item["name"].as_str().unwrap();
+            if [
+                "connect",
+                "disconnect",
+                "send_command",
+                "read_output",
+                "clear_output",
+                "set_prompt_pattern",
+                "login",
+                "enter_bootloader",
+                "upload_file",
+                "download_file",
+                "view_io",
+                "set_baudrate",
+            ]
+            .contains(&name)
+            {
+                assert!(item["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("port")));
+            }
         }
         let send = tools
             .iter()
             .find(|tool| tool["name"] == "send_command")
             .unwrap();
-        assert!(validate_args(&send["inputSchema"], &json!({"text":"abc"})).is_ok());
+        assert!(validate_args(
+            &send["inputSchema"],
+            &json!({"port":"/dev/fake", "text":"abc"})
+        )
+        .is_ok());
         assert!(validate_args(&send["inputSchema"], &json!({}))
             .unwrap_err()
-            .contains("text"));
-        assert!(validate_args(&send["inputSchema"], &json!({"text":42}))
-            .unwrap_err()
-            .contains("wrong type"));
-        assert!(
-            validate_args(&send["inputSchema"], &json!({"text":"x", "extra":true}))
-                .unwrap_err()
-                .contains("unexpected")
-        );
+            .contains("port"));
+        assert!(validate_args(
+            &send["inputSchema"],
+            &json!({"port":"/dev/fake", "text":42})
+        )
+        .unwrap_err()
+        .contains("wrong type"));
+        assert!(validate_args(
+            &send["inputSchema"],
+            &json!({"port":"/dev/fake", "text":"x", "extra":true})
+        )
+        .unwrap_err()
+        .contains("unexpected"));
         let bootloader = tools
             .iter()
             .find(|tool| tool["name"] == "enter_bootloader")
             .unwrap();
-        assert!(
-            validate_args(&bootloader["inputSchema"], &json!({"interrupt_keys":[" "]})).is_ok()
-        );
-        assert!(
-            validate_args(&bootloader["inputSchema"], &json!({"interrupt_keys":[7]}))
-                .unwrap_err()
-                .contains("interrupt_keys")
-        );
+        assert!(validate_args(
+            &bootloader["inputSchema"],
+            &json!({"port":"/dev/fake", "interrupt_keys":[" "]})
+        )
+        .is_ok());
+        assert!(validate_args(
+            &bootloader["inputSchema"],
+            &json!({"port":"/dev/fake", "interrupt_keys":[7]})
+        )
+        .unwrap_err()
+        .contains("interrupt_keys"));
     }
 
     #[test]
