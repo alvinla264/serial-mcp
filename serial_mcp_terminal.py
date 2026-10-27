@@ -80,7 +80,7 @@ def _device_list(client: ipc.DaemonClient, fd: int, err_fd: int) -> int:
                   if line.strip() and not line.startswith("No serial ports found")]
                  if isinstance(ports, str) else [])
         _write(err_fd, "\x1b[H\x1b[2Jserial-mcp-terminal — device list (↑/↓ select, Enter join, q quit)\r\n")
-        _write(err_fd, f"Registered MCP clients: {status.get('clients', 0)}\r\n\r\n")
+        _write(err_fd, f"Registered clients (MCP + human): {status.get('clients', 0)}\r\n\r\n")
         if not known:
             _write(err_fd, "No serial devices found. Waiting for devices…\r\n")
         for index, item in enumerate(known[:MAX_SCREEN_ROWS]):
@@ -163,8 +163,23 @@ def _terminal_pane(client: ipc.DaemonClient, port: str, baud: int | None,
             elif event.get("event") == "settings" and event.get("port") == port:
                 baud = event.get("baudrate", baud)
                 _write(err_fd, f"\r\n[baud rate changed to {baud}; concurrent output may be affected]\r\n")
+            elif event.get("event") == "settings_gap" and event.get("port") == port:
+                try:
+                    devices = client.status().get("devices", [])
+                    current = next((item.get("baudrate") for item in devices
+                                    if item.get("port") == port), None)
+                    if isinstance(current, int) and not isinstance(current, bool):
+                        baud = current
+                        notice = f"settings notices lost; current baud is {baud}"
+                    else:
+                        notice = "settings notices lost; current baud is unavailable"
+                except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError):
+                    notice = "settings notices lost; current baud could not be refreshed"
+                _write(err_fd, f"\r\n[{notice}]\r\n")
             elif event.get("event") == "output_gap" and event.get("port") == port:
                 _write(err_fd, f"\r\n[output gap: {event.get('dropped_bytes', 0)} bytes dropped]\r\n")
+            elif event.get("event") == "event_gap":
+                _write(err_fd, f"\r\n[terminal event queue overflow: {event.get('dropped_events', 0)} events lost; output or settings may be incomplete]\r\n")
             elif event.get("event") in ("closed", "shutdown"):
                 _write(err_fd, "\r\nserial-mcp-terminal: daemon connection closed\r\n")
                 return 1

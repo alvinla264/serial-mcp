@@ -9,6 +9,7 @@ import subprocess
 import sys
 import termios
 import threading
+import tty
 import time
 from pathlib import Path
 
@@ -17,11 +18,12 @@ import pytest
 import serial_mcp_daemon
 import serial_mcp_engine
 import serial_mcp_ipc as ipc
+import serial_mcp_terminal as terminal
 
 ROOT = Path(__file__).resolve().parent
 
 
-def test_terminal_lists_count_without_identity_and_quits_cleanly(tmp_path):
+def test_terminal_lists_total_count_without_identity_and_quits_cleanly(tmp_path):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o700)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -41,7 +43,8 @@ def test_terminal_lists_count_without_identity_and_quits_cleanly(tmp_path):
                         result = {"protocol": 2, "daemon_version": "test", "client_id": "private",
                                   "role": "human", "clients": 2, "devices": []}
                     elif op == "status":
-                        result = {"protocol": 2, "clients": 2, "devices": [], "grace": None}
+                        result = {"protocol": 2, "clients": 2,
+                                  "devices": [], "grace": None}
                     elif op == "ports":
                         result = {"result": "/dev/test-serial  synthetic port"}
                     else:
@@ -74,7 +77,7 @@ def test_terminal_lists_count_without_identity_and_quits_cleanly(tmp_path):
         server.join(timeout=5)
         assert not server.is_alive()
         assert process.returncode == 0
-        assert b"Registered MCP clients: 2" in terminal_output
+        assert b"Registered clients (MCP + human): 2" in terminal_output
         assert b"/dev/test-serial" in terminal_output
         assert b"private" not in terminal_output
     finally:
@@ -126,7 +129,7 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
     ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
     try:
         ai.hello(role="mcp", name="synthetic-idle-client")
-        wait_for(b"Registered MCP clients: 2")
+        wait_for(b"Registered clients (MCP + human): 2")
         wait_for(port.encode())
         mark = len(output)
         os.write(human_master, b"\r")
@@ -162,6 +165,15 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         os.write(human_master, b"\x1d")
         wait_for(b"device list", timeout=5, start=mark)
         assert ai.status()["devices"] == []  # listing does not retain human membership
+        idle_mcp = ipc.DaemonClient.connect(runtime / "daemon.sock")
+        try:
+            idle_mcp.hello(role="mcp", name="synthetic-second-idle")
+            mark = len(output)
+            wait_for(b"Registered clients (MCP + human): 3", start=mark)
+        finally:
+            idle_mcp.close()
+        mark = len(output)
+        wait_for(b"Registered clients (MCP + human): 2", start=mark)
         # Ctrl-] is a local navigation key and must not be written to the serial PTY.
         ready, _, _ = select.select([device_master], [], [], 0.2)
         if ready:
@@ -230,6 +242,8 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         if ready:
             assert b"\x11" not in os.read(device_master, 4096)
         assert termios.tcgetattr(human_master) == initial_tty
+        assert b"synthetic-idle-client" not in output
+        assert b"synthetic-second-idle" not in output
     finally:
         ai.close()
         if process.poll() is None:
@@ -240,7 +254,7 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         os.close(device_master)
 
 
-@pytest.mark.parametrize("shutdown", ["sigterm", "daemon-loss"])
+@pytest.mark.parametrize("shutdown", ["sigterm", "sigint", "daemon-loss", "terminal-output-error"])
 def test_terminal_restores_tty_and_deregisters_on_signal_or_daemon_loss(tmp_path, monkeypatch, shutdown):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o700)
@@ -273,14 +287,18 @@ def test_terminal_restores_tty_and_deregisters_on_signal_or_daemon_loss(tmp_path
     ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
     try:
         ai.hello(role="mcp", name="synthetic-idle-client")
-        wait_for(b"Registered MCP clients: 2")
-        if shutdown == "sigterm":
-            process.send_signal(signal.SIGTERM)
+        wait_for(b"Registered clients (MCP + human): 2")
+        if shutdown in ("sigterm", "sigint"):
+            process.send_signal(signal.SIGTERM if shutdown == "sigterm" else signal.SIGINT)
             assert process.wait(timeout=5) == 130
             assert ai.status()["clients"] == 1
-        else:
+        elif shutdown == "daemon-loss":
             daemon.stop("test daemon loss")
             assert process.wait(timeout=5) == 1
+        else:
+            process.stderr.close()
+            assert process.wait(timeout=5) != 0
+            assert ai.status()["clients"] == 1
         assert termios.tcgetattr(human_master) == initial_tty
     finally:
         ai.close()
@@ -338,7 +356,7 @@ def test_terminal_keeps_device_output_streams_independent(tmp_path, monkeypatch)
         ai.hello(role="mcp", name="synthetic-observer")
         assert ai.call("connect", {"port": first_port, "baudrate": 115200})["control"] == "granted"
         ai.subscribe(first_port)
-        wait_for(b"Registered MCP clients: 2")
+        wait_for(b"Registered clients (MCP + human): 2")
         wait_for(second_port.encode())
         mark = len(output)
         os.write(human_master, b"j")
@@ -388,3 +406,187 @@ def test_terminal_keeps_device_output_streams_independent(tmp_path, monkeypatch)
         os.close(human_master)
         os.close(first_master)
         os.close(second_master)
+
+
+def test_terminal_reports_unavailable_port_and_returns_to_the_list(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    missing_port = str(tmp_path / "disappeared-serial-port")
+    monkeypatch.setattr(
+        serial_mcp_engine.serial.tools.list_ports,
+        "comports",
+        lambda: [type("Port", (), {"device": missing_port, "description": "synthetic", "hwid": ""})()],
+    )
+    state = serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
+    daemon = serial_mcp_daemon.DaemonServer(runtime, state=state)
+    daemon.start()
+    human_master, human_slave = pty.openpty()
+    initial_tty = termios.tcgetattr(human_slave)
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime),
+               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "serial_mcp_terminal"], cwd=ROOT, env=env,
+        stdin=human_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    os.close(human_slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=5, start=0):
+        deadline = time.monotonic() + timeout
+        while needle not in output[start:] and time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stderr], [], [], 0.1)
+            if readable:
+                chunk = os.read(process.stderr.fileno(), 4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+        assert needle in output[start:], output.decode("utf-8", "replace")[-2000:]
+
+    try:
+        wait_for(b"Registered clients (MCP + human): 1")
+        wait_for(missing_port.encode())
+        mark = len(output)
+        os.write(human_master, b"\r")
+        wait_for(b"Baud rate (e.g. 115200): ", start=mark)
+        os.write(human_master, b"115200\r")
+        wait_for(f"cannot join {missing_port}".encode(), start=mark)
+        assert daemon.status()["devices"] == []
+        assert process.poll() is None
+        os.write(human_master, b"q")
+        assert process.wait(timeout=5) == 0
+        assert termios.tcgetattr(human_master) == initial_tty
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        daemon.stop("test complete")
+        os.close(human_master)
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"event": "event_gap", "dropped_events": 3,
+          "reason": "client event queue overflow"}, b"3 events lost"),
+        ({"event": "settings_gap", "port": "/dev/synthetic"},
+         b"settings notices lost; current baud is 57600"),
+    ],
+)
+def test_terminal_reports_dropped_event_and_settings_notices(event, expected):
+    terminal_master, terminal_slave = pty.openpty()
+    tty.setraw(terminal_slave)
+    output_read, output_write = os.pipe()
+
+    class Events:
+        calls = 0
+
+        def next_event(self, timeout=0):
+            self.calls += 1
+            if self.calls == 1:
+                return event
+            if self.calls == 2:
+                os.write(terminal_master, b"\x1d")
+            return None
+
+        def status(self):
+            return {"devices": [{"port": "/dev/synthetic", "baudrate": 57600}]}
+
+    try:
+        assert terminal._terminal_pane(Events(), "/dev/synthetic", 115200,
+                                       terminal_slave, output_write) == 0
+        diagnostics = os.read(output_read, 4096)
+        assert expected in diagnostics
+        if event["event"] == "event_gap":
+            assert b"output or settings may be incomplete" in diagnostics
+    finally:
+        os.close(terminal_master)
+        os.close(terminal_slave)
+        os.close(output_read)
+        os.close(output_write)
+
+
+def test_terminal_slow_stdout_keeps_rss_bounded_and_reports_event_loss(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    device_master, device_slave = pty.openpty()
+    port = os.ttyname(device_slave)
+    os.close(device_slave)
+    monkeypatch.setattr(
+        serial_mcp_engine.serial.tools.list_ports,
+        "comports",
+        lambda: [type("Port", (), {"device": port, "description": "synthetic", "hwid": ""})()],
+    )
+    state = serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
+    daemon = serial_mcp_daemon.DaemonServer(runtime, state=state)
+    daemon.start()
+    human_master, human_slave = pty.openpty()
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime),
+               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "serial_mcp_terminal"], cwd=ROOT, env=env,
+        stdin=human_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    os.close(human_slave)
+    diagnostics = bytearray()
+
+    def read_until(needle, timeout=10, start=0):
+        deadline = time.monotonic() + timeout
+        while needle not in diagnostics[start:] and time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+            for stream in readable:
+                chunk = os.read(stream.fileno(), 65536)
+                if stream is process.stderr:
+                    diagnostics.extend(chunk)
+        assert needle in diagnostics[start:], diagnostics.decode("utf-8", "replace")[-2000:]
+
+    producer = None
+    try:
+        read_until(b"Registered clients (MCP + human): 1")
+        read_until(port.encode())
+        mark = len(diagnostics)
+        os.write(human_master, b"\r")
+        read_until(b"Baud rate (e.g. 115200): ", start=mark)
+        os.write(human_master, b"115200\r")
+        read_until(b"Ctrl-] returns to device list", start=mark)
+        with open(f"/proc/{process.pid}/status", encoding="ascii") as status_file:
+            baseline = next(int(line.split()[1]) for line in status_file if line.startswith("VmRSS:"))
+
+        payload = b"x" * (4 * 1024 * 1024)
+        write_errors = []
+        def flood_device():
+            offset = 0
+            try:
+                while offset < len(payload):
+                    offset += os.write(device_master, payload[offset:offset + 8192])
+            except OSError as exc:
+                write_errors.append(exc)
+
+        producer = threading.Thread(target=flood_device, daemon=True)
+        producer.start()
+        producer.join(timeout=15)
+        assert not producer.is_alive(), "synthetic device flood did not drain"
+        assert not write_errors, write_errors
+        with open(f"/proc/{process.pid}/status", encoding="ascii") as status_file:
+            current = next(int(line.split()[1]) for line in status_file if line.startswith("VmRSS:"))
+        assert current - baseline < 64 * 1024  # bounded IPC event queue; under 64 MiB growth
+        read_until(b"terminal event queue overflow", timeout=10)
+        mark = len(diagnostics)
+        os.write(human_master, b"\x1d")
+        read_until(b"device list", timeout=5, start=mark)
+        os.write(human_master, b"\x11")
+        assert process.wait(timeout=5) == 0
+        assert daemon.status()["clients"] == 0
+        assert daemon.status()["devices"] == []
+    finally:
+        if producer is not None and producer.is_alive():
+            os.close(device_master)
+            producer.join(timeout=1)
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        daemon.stop("test complete")
+        os.close(human_master)
+        try:
+            os.close(device_master)
+        except OSError:
+            pass
