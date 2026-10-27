@@ -1,7 +1,9 @@
 """Public IPC/pty smoke coverage for the multi-device terminal list and exit."""
+import base64
 import os
 import pty
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -9,6 +11,8 @@ import termios
 import threading
 import time
 from pathlib import Path
+
+import pytest
 
 import serial_mcp_daemon
 import serial_mcp_engine
@@ -135,6 +139,14 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         os.write(human_master, b"\r")
         mark = len(output)
         wait_for(b"Baud rate (e.g. 115200): ", start=mark)
+        mark = len(output)
+        os.write(human_master, b"not-a-number\r")
+        wait_for(b"Invalid baud rate.", start=mark)
+        mark = len(output)
+        wait_for(b"device list", start=mark)
+        os.write(human_master, b"\r")
+        mark = len(output)
+        wait_for(b"Baud rate (e.g. 115200): ", start=mark)
         os.write(human_master, b"115200\r")
         wait_for(b"Ctrl-] returns to device list", start=mark)
         os.write(device_master, b"synthetic-rx")
@@ -167,6 +179,35 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         os.write(human_master, b"\r")
         wait_for(b"Ctrl-] returns to device list", start=mark)
         assert b"Baud rate (e.g. 115200): " not in output[mark:]
+        operation_result = []
+        operation = threading.Thread(
+            target=lambda: operation_result.append(ai.call("send_command", {
+                "port": port, "text": "active-operation", "timeout": 4, "idle_timeout": 0.5,
+            }))
+        )
+        operation.start()
+        wire = bytearray()
+        deadline = time.monotonic() + 5
+        while b"active-operation\n" not in wire and time.monotonic() < deadline:
+            readable, _, _ = select.select([device_master], [], [], 0.1)
+            if readable:
+                wire.extend(os.read(device_master, 4096))
+        assert b"active-operation\n" in wire
+        os.write(human_master, b"human-during-operation")
+        deadline = time.monotonic() + 5
+        while b"human-during-operation" not in wire and time.monotonic() < deadline:
+            readable, _, _ = select.select([device_master], [], [], 0.1)
+            if readable:
+                wire.extend(os.read(device_master, 4096))
+        assert b"human-during-operation" in wire
+        mark = len(output)
+        changed = ai.call("set_baudrate", {"port": port, "baudrate": 57600})
+        assert changed["baudrate"] == 57600
+        wait_for(b"baud rate changed to 57600", start=mark)
+        os.write(device_master, b"operation-complete")
+        operation.join(timeout=5)
+        assert not operation.is_alive()
+        assert operation_result
         os.write(human_master, b"normal-tx")
         transmitted = bytearray()
         deadline = time.monotonic() + 5
@@ -184,6 +225,10 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         while ai.status()["clients"] != 1 and time.monotonic() < deadline:
             time.sleep(0.02)
         assert ai.status()["clients"] == 1
+        assert [item["port"] for item in ai.status()["devices"]] == [port]
+        ready, _, _ = select.select([device_master], [], [], 0.2)
+        if ready:
+            assert b"\x11" not in os.read(device_master, 4096)
         assert termios.tcgetattr(human_master) == initial_tty
     finally:
         ai.close()
@@ -193,3 +238,153 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         daemon.stop("test complete")
         os.close(human_master)
         os.close(device_master)
+
+
+@pytest.mark.parametrize("shutdown", ["sigterm", "daemon-loss"])
+def test_terminal_restores_tty_and_deregisters_on_signal_or_daemon_loss(tmp_path, monkeypatch, shutdown):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setattr(serial_mcp_engine.serial.tools.list_ports, "comports", lambda: [])
+    state = serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
+    daemon = serial_mcp_daemon.DaemonServer(runtime, state=state)
+    daemon.start()
+    human_master, human_slave = pty.openpty()
+    initial_tty = termios.tcgetattr(human_slave)
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime),
+               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "serial_mcp_terminal"], cwd=ROOT, env=env,
+        stdin=human_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    os.close(human_slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=5):
+        deadline = time.monotonic() + timeout
+        while needle not in output and time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stderr], [], [], 0.1)
+            if readable:
+                chunk = os.read(process.stderr.fileno(), 4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+        assert needle in output, output.decode("utf-8", "replace")[-2000:]
+
+    ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
+    try:
+        ai.hello(role="mcp", name="synthetic-idle-client")
+        wait_for(b"Registered MCP clients: 2")
+        if shutdown == "sigterm":
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=5) == 130
+            assert ai.status()["clients"] == 1
+        else:
+            daemon.stop("test daemon loss")
+            assert process.wait(timeout=5) == 1
+        assert termios.tcgetattr(human_master) == initial_tty
+    finally:
+        ai.close()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        if not daemon.stopped:
+            daemon.stop("test complete")
+        os.close(human_master)
+
+
+def test_terminal_keeps_device_output_streams_independent(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    first_master, first_slave = pty.openpty()
+    first_port = os.ttyname(first_slave)
+    os.close(first_slave)
+    second_master, second_slave = pty.openpty()
+    second_port = os.ttyname(second_slave)
+    os.close(second_slave)
+    monkeypatch.setattr(
+        serial_mcp_engine.serial.tools.list_ports,
+        "comports",
+        lambda: [
+            type("Port", (), {"device": port, "description": "synthetic", "hwid": ""})()
+            for port in (first_port, second_port)
+        ],
+    )
+    state = serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
+    daemon = serial_mcp_daemon.DaemonServer(runtime, state=state)
+    daemon.start()
+    human_master, human_slave = pty.openpty()
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime),
+               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "serial_mcp_terminal"], cwd=ROOT, env=env,
+        stdin=human_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    os.close(human_slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=5, start=0):
+        deadline = time.monotonic() + timeout
+        while needle not in output[start:] and time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stderr], [], [], 0.1)
+            if readable:
+                chunk = os.read(process.stderr.fileno(), 4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+        assert needle in output[start:], output.decode("utf-8", "replace")[-2000:]
+
+    ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
+    try:
+        ai.hello(role="mcp", name="synthetic-observer")
+        assert ai.call("connect", {"port": first_port, "baudrate": 115200})["control"] == "granted"
+        ai.subscribe(first_port)
+        wait_for(b"Registered MCP clients: 2")
+        wait_for(second_port.encode())
+        mark = len(output)
+        os.write(human_master, b"j")
+        wait_for(f"> {second_port}:".encode(), start=mark)
+        mark = len(output)
+        os.write(human_master, b"\r")
+        wait_for(b"Baud rate (e.g. 115200): ", start=mark)
+        os.write(human_master, b"57600\r")
+        wait_for(b"Ctrl-] returns to device list", start=mark)
+
+        os.write(first_master, b"first-only-output")
+        observed = bytearray()
+        deadline = time.monotonic() + 5
+        while b"first-only-output" not in observed and time.monotonic() < deadline:
+            event = ai.next_event(timeout=0.1)
+            if event and event.get("event") == "output" and event.get("port") == first_port:
+                observed.extend(base64.b64decode(event["data"], validate=True))
+        assert b"first-only-output" in observed
+        readable, _, _ = select.select([process.stdout], [], [], 0.2)
+        assert not readable  # the pane does not consume another observer's port stream
+
+        os.write(second_master, b"selected-device-output")
+        received = bytearray()
+        deadline = time.monotonic() + 5
+        while b"selected-device-output" not in received and time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stdout], [], [], 0.1)
+            if readable:
+                received.extend(os.read(process.stdout.fileno(), 4096))
+        assert b"selected-device-output" in received
+        assert b"first-only-output" not in received
+
+        mark = len(output)
+        os.write(human_master, b"\x1d")
+        wait_for(b"device list", start=mark)
+        status = ai.status()
+        assert [item["port"] for item in status["devices"]] == [first_port]
+        os.write(human_master, b"\x11")
+        assert process.wait(timeout=5) == 0
+        assert ai.status()["clients"] == 1
+    finally:
+        ai.close()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        if not daemon.stopped:
+            daemon.stop("test complete")
+        os.close(human_master)
+        os.close(first_master)
+        os.close(second_master)
