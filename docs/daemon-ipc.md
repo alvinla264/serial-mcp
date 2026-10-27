@@ -164,6 +164,11 @@ reconnect, inspect status/output, and explicitly call `connect(port,baudrate)`
 to regain control. On socket EOF/crash daemon membership cleanup follows the
 same safe-settlement/last-member-close rules as `disconnect`.
 
-This contract intentionally breaks v1. Existing Rust and Python frontends need
-migration and must fail clearly at version negotiation meanwhile; combined
-frontend integration and Cargo checks belong to the dependent migration tasks.
+This contract intentionally breaks v1. The Rust shared-app frontend and native
+human terminal negotiate v2 before use; the Python parity oracle remains a
+legacy-only v1 adapter outside the supported shared-app surface. Old v1 clients
+must fail clearly at version negotiation and must never reinterpret multi-device
+state as single-device state. The public Rust MCP catalog requires an explicit
+`port` for each device-scoped tool and exposes `set_baudrate`; it removes
+`attach`, `tio_info`, and the three public lease tools. The supported shared app
+never creates a raw tio socket or companion pty.
