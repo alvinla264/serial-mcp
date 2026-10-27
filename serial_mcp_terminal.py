@@ -70,6 +70,11 @@ def _device_list(client: ipc.DaemonClient, fd: int, err_fd: int) -> int:
     while True:
         try:
             status = client.status()
+            mcp_clients = status.get("mcp_clients")
+            if (not isinstance(mcp_clients, int) or isinstance(mcp_clients, bool)
+                    or mcp_clients < 0):
+                _write(err_fd, "\r\nserial-mcp-terminal: daemon does not provide MCP-only client counts; update the daemon\r\n")
+                return 1
             ports = client.list_ports().get("result", [])
         except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError) as exc:
             _write(err_fd, f"\r\nserial-mcp-terminal: daemon unavailable: {exc}\r\n")
@@ -80,7 +85,7 @@ def _device_list(client: ipc.DaemonClient, fd: int, err_fd: int) -> int:
                   if line.strip() and not line.startswith("No serial ports found")]
                  if isinstance(ports, str) else [])
         _write(err_fd, "\x1b[H\x1b[2Jserial-mcp-terminal — device list (↑/↓ select, Enter join, q quit)\r\n")
-        _write(err_fd, f"Registered clients (MCP + human): {status.get('clients', 0)}\r\n\r\n")
+        _write(err_fd, f"Registered MCP clients: {mcp_clients}\r\n\r\n")
         if not known:
             _write(err_fd, "No serial devices found. Waiting for devices…\r\n")
         for index, item in enumerate(known[:MAX_SCREEN_ROWS]):

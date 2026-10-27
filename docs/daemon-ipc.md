@@ -23,7 +23,8 @@ ignored. A well-formed unsupported-version frame receives `unsupported_version`
 and closes. Errors never contain private controller identity.
 
 A client becomes registered only after `hello`; idle registered MCP and human
-clients count in `status.clients`. EOF/crash unregisters immediately. Zero
+clients count in `status.clients`, while `status.mcp_clients` counts only MCP
+clients. EOF/crash unregisters immediately. Zero
 registered clients starts the 30-second shutdown grace; a new hello cancels it.
 The daemon closes devices only after memberships leave and safe operations settle.
 A disconnected client leaves every device. Registration alone holds no device.
@@ -44,17 +45,23 @@ events/cursors within the daemon lifetime, not as a global identity.
 First request is `hello`:
 
 - `hello {role:"mcp"|"human", name:string<=64, pid?:int, client_version?:string}`
-  → `{protocol:2,daemon_version,client_id,role,clients,devices:[snapshot...]}`.
-  `client_id` is private to that caller's handshake; never disclose other client
-  names, IDs, or membership mappings.
-- `status {}` → `{protocol,daemon_version,clients,grace,shutting_down,devices}`.
+  → `{protocol:2,daemon_version,client_id,role,clients,mcp_clients,devices:[snapshot...]}`.
+  `clients` is the all-role registered-client total; `mcp_clients` counts only
+  registered MCP clients, including idle MCP clients and excluding human
+  terminals. These are totals only. `client_id` is private to that caller's
+  handshake; never disclose other client names, IDs, or membership mappings.
+  `mcp_clients` is an additive v2 field; a human terminal that requires it must
+  fail clearly against an older v2 daemon rather than mislabel the total.
+- `status {}` → `{protocol,daemon_version,clients,mcp_clients,grace,shutting_down,devices}`.
+  `clients` counts all registered MCP and human clients; `mcp_clients` counts
+  registered MCP clients only, including idle clients.
   Each device snapshot is `{device_id,port,state:"connected"|"disconnected"|"closing",
   baudrate,control:"available"|"held",members:n,generation}`. A vanished tty is
   reported as `disconnected`; a later `connect` on the same selector reopens it
   before returning success. No controller identity is exposed. `clients` counts
-  every registered client, including clients with no memberships; `members` is
-  the number of AI/human participants
-  joined to that device.
+  all registered clients, including clients with no memberships; `mcp_clients`
+  is the MCP-only count. `members` is the number of AI/human participants joined
+  to that device.
 - `call {tool,args}` invokes an approved engine tool. Device-affecting tools
   require `args.port`; `connect` also requires `baudrate`. `connect(port,baudrate)`
   resolves/opens or joins the physical device and requests control atomically.
@@ -133,8 +140,9 @@ settings), and `device` with `state` equal to `open` (physical tty opened or
 reopened), `joined` / `left` (membership changed), `disconnected` (physical tty
 vanished), or `closed` (physical tty close completed). Device events carry
 snapshot-safe `device_id`, `port`, `baudrate`, and `generation` fields. `output`,
-`output_gap`, `control_lost`, `clients` (count only), `event_gap` (local client
-event queue overflow), and `shutdown` are also emitted. These names describe the
+`output_gap`, `control_lost`, `clients` (all-role `clients` and MCP-only
+`mcp_clients` counts only), `event_gap` (local client event queue overflow), and
+`shutdown` are also emitted. These names describe the
 wire states; `connected` is a status snapshot value, not a device-event state.
 Events are not authorization. MCP clients retain
 settings notices in a bounded per-device queue and prepend notices to the next

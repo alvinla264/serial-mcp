@@ -1,6 +1,6 @@
 # Human terminal (`serial-mcp-terminal`)
 
-`serial-mcp-terminal` is a stdlib-only multi-device TUI over daemon IPC v2. It lists serial ports, shows the daemon's registered-client total and per-device connection/baud/control status, and joins a selected port in a terminal pane. Listing does not pin devices; membership lasts only while the pane is open. Human input requires no AI lease and is sent immediately.
+`serial-mcp-terminal` is a stdlib-only multi-device TUI over daemon IPC v2. It lists serial ports, shows registered MCP client count and per-device connection/baud/control status, and joins a selected port in a terminal pane. Listing does not pin devices; membership lasts only while the pane is open. Human input requires no AI lease and is sent immediately.
 
 ## Install and launch
 
@@ -14,7 +14,7 @@ python -m serial_mcp_terminal
 nix run .#terminal
 ```
 
-Run from a real terminal (stdin must be a tty). The app starts or joins the per-user daemon. Use Up/Down or j/k to choose a port, Enter to join, and `q` or Ctrl-Q to quit from the list. An unopened port prompts for baud (an integer from 1 through 4,000,000); malformed or out-of-range input is rejected. An already-open device is joined at its actual baud without prompting or reconfiguration. The displayed registered-client total includes idle MCP clients and human terminals (including this TUI); the current daemon protocol does not provide an MCP-only total. No client names/IDs or controller identity are displayed.
+Run from a real terminal (stdin must be a tty). The app starts or joins the per-user daemon. Use Up/Down or j/k to choose a port, Enter to join, and `q` or Ctrl-Q to quit from the list. An unopened port prompts for baud (an integer from 1 through 4,000,000); malformed or out-of-range input is rejected. An already-open device is joined at its actual baud without prompting or reconfiguration. The MCP count includes idle MCP clients but excludes human terminals. If an already-running older v2 daemon lacks the MCP-only count field, the TUI exits with an update-daemon diagnostic instead of displaying a misleading total. No client names/IDs or controller identity are displayed.
 
 | Input | Action |
 |---|---|

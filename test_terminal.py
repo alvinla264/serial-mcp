@@ -23,7 +23,8 @@ import serial_mcp_terminal as terminal
 ROOT = Path(__file__).resolve().parent
 
 
-def test_terminal_lists_total_count_without_identity_and_quits_cleanly(tmp_path):
+@pytest.mark.parametrize("has_mcp_count", [True, False])
+def test_terminal_requires_mcp_count_and_hides_client_identity(tmp_path, has_mcp_count):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o700)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -45,6 +46,8 @@ def test_terminal_lists_total_count_without_identity_and_quits_cleanly(tmp_path)
                     elif op == "status":
                         result = {"protocol": 2, "clients": 2,
                                   "devices": [], "grace": None}
+                        if has_mcp_count:
+                            result["mcp_clients"] = 1
                     elif op == "ports":
                         result = {"result": "/dev/test-serial  synthetic port"}
                     else:
@@ -63,22 +66,29 @@ def test_terminal_lists_total_count_without_identity_and_quits_cleanly(tmp_path)
                                    stderr=subprocess.PIPE)
         terminal_output = bytearray()
         deadline = time.monotonic() + 5
-        while b"Ctrl-Q quits." not in terminal_output and time.monotonic() < deadline:
+        expected = (b"Ctrl-Q quits." if has_mcp_count
+                    else b"does not provide MCP-only client counts")
+        while expected not in terminal_output and time.monotonic() < deadline:
             readable, _, _ = select.select([process.stderr], [], [], 0.1)
             if readable:
                 chunk = os.read(process.stderr.fileno(), 4096)
                 if not chunk:
                     break
                 terminal_output.extend(chunk)
-        assert b"Ctrl-Q quits." in terminal_output
-        os.write(master, b"q")
-        stdout, stderr = process.communicate(timeout=10)
-        terminal_output.extend(stderr)
+        assert expected in terminal_output
+        if has_mcp_count:
+            os.write(master, b"q")
+            stdout, stderr = process.communicate(timeout=10)
+            terminal_output.extend(stderr)
+            assert process.returncode == 0
+            assert b"Registered MCP clients: 1" in terminal_output
+            assert b"/dev/test-serial" in terminal_output
+        else:
+            stdout, stderr = process.communicate(timeout=10)
+            terminal_output.extend(stderr)
+            assert process.returncode == 1
         server.join(timeout=5)
         assert not server.is_alive()
-        assert process.returncode == 0
-        assert b"Registered clients (MCP + human): 2" in terminal_output
-        assert b"/dev/test-serial" in terminal_output
         assert b"private" not in terminal_output
     finally:
         os.close(master)
@@ -129,7 +139,7 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
     ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
     try:
         ai.hello(role="mcp", name="synthetic-idle-client")
-        wait_for(b"Registered clients (MCP + human): 2")
+        wait_for(b"Registered MCP clients: 1")
         wait_for(port.encode())
         mark = len(output)
         os.write(human_master, b"\r")
@@ -169,11 +179,11 @@ def test_terminal_joins_real_isolated_daemon_and_leaves_without_transmitting_con
         try:
             idle_mcp.hello(role="mcp", name="synthetic-second-idle")
             mark = len(output)
-            wait_for(b"Registered clients (MCP + human): 3", start=mark)
+            wait_for(b"Registered MCP clients: 2", start=mark)
         finally:
             idle_mcp.close()
         mark = len(output)
-        wait_for(b"Registered clients (MCP + human): 2", start=mark)
+        wait_for(b"Registered MCP clients: 1", start=mark)
         # Ctrl-] is a local navigation key and must not be written to the serial PTY.
         ready, _, _ = select.select([device_master], [], [], 0.2)
         if ready:
@@ -287,7 +297,7 @@ def test_terminal_restores_tty_and_deregisters_on_signal_or_daemon_loss(tmp_path
     ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
     try:
         ai.hello(role="mcp", name="synthetic-idle-client")
-        wait_for(b"Registered clients (MCP + human): 2")
+        wait_for(b"Registered MCP clients: 1")
         if shutdown in ("sigterm", "sigint"):
             process.send_signal(signal.SIGTERM if shutdown == "sigterm" else signal.SIGINT)
             assert process.wait(timeout=5) == 130
@@ -356,7 +366,7 @@ def test_terminal_keeps_device_output_streams_independent(tmp_path, monkeypatch)
         ai.hello(role="mcp", name="synthetic-observer")
         assert ai.call("connect", {"port": first_port, "baudrate": 115200})["control"] == "granted"
         ai.subscribe(first_port)
-        wait_for(b"Registered clients (MCP + human): 2")
+        wait_for(b"Registered MCP clients: 1")
         wait_for(second_port.encode())
         mark = len(output)
         os.write(human_master, b"j")
@@ -443,7 +453,7 @@ def test_terminal_reports_unavailable_port_and_returns_to_the_list(tmp_path, mon
         assert needle in output[start:], output.decode("utf-8", "replace")[-2000:]
 
     try:
-        wait_for(b"Registered clients (MCP + human): 1")
+        wait_for(b"Registered MCP clients: 0")
         wait_for(missing_port.encode())
         mark = len(output)
         os.write(human_master, b"\r")
@@ -541,7 +551,7 @@ def test_terminal_slow_stdout_keeps_rss_bounded_and_reports_event_loss(tmp_path,
 
     producer = None
     try:
-        read_until(b"Registered clients (MCP + human): 1")
+        read_until(b"Registered MCP clients: 0")
         read_until(port.encode())
         mark = len(diagnostics)
         os.write(human_master, b"\r")

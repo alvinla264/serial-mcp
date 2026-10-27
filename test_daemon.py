@@ -85,6 +85,53 @@ def fake_tty():
     return master, port
 
 
+def test_client_counts_distinguish_mcp_from_multiple_humans_in_ipc(live_daemon):
+    daemon, _clock, _new_client = live_daemon
+    mcp = ipc.DaemonClient.connect(daemon.socket_path)
+    human = ipc.DaemonClient.connect(daemon.socket_path)
+    second_human = ipc.DaemonClient.connect(daemon.socket_path)
+    second_mcp = ipc.DaemonClient.connect(daemon.socket_path)
+    try:
+        mcp_hello = mcp.hello(role="mcp", name="synthetic-mcp")
+        assert mcp_hello["clients"] == 1
+        assert mcp_hello["mcp_clients"] == 1
+        event_of(mcp, "clients")
+
+        human_hello = human.hello(role="human", name="synthetic-human")
+        assert human_hello["clients"] == 2
+        assert human_hello["mcp_clients"] == 1
+        assert human.status()["mcp_clients"] == 1
+        count = event_of(human, "clients")
+        assert count["clients"] == 2
+        assert count["mcp_clients"] == 1
+
+        second_human.hello(role="human", name="synthetic-human-two")
+        count = event_of(human, "clients")
+        assert count["clients"] == 3
+        assert count["mcp_clients"] == 1
+        assert human.status()["mcp_clients"] == 1
+
+        second_mcp.hello(role="mcp", name="synthetic-mcp-two")
+        count = event_of(human, "clients")
+        assert count["clients"] == 4
+        assert count["mcp_clients"] == 2
+        assert human.status()["mcp_clients"] == 2
+
+        second_human.close()
+        count = event_of(human, "clients")
+        assert count["clients"] == 3
+        assert count["mcp_clients"] == 2
+        second_mcp.close()
+        count = event_of(human, "clients")
+        assert count["clients"] == 2
+        assert count["mcp_clients"] == 1
+    finally:
+        mcp.close()
+        human.close()
+        second_human.close()
+        second_mcp.close()
+
+
 def test_shutdown_bounds_inflight_operation_drain(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon_module, "DRAIN_TIMEOUT_SECONDS", 0.05)
     disconnect_started = threading.Event()
