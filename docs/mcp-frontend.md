@@ -1,65 +1,77 @@
-# MCP frontend migration status
+# MCP frontend and daemon protocol
 
-## Breaking transition to daemon protocol v2
+## Supported shared application
 
-The shared daemon on this branch speaks protocol v2. The Rust stdio MCP frontend
-(`serial-mcp`) and the retained Python daemon frontend (`serial_mcp_client.py`)
-still speak protocol v1 and **cannot be used with this daemon**. They fail clearly
-when their hello response reports an incompatible version. The Rust frontend
-migration is pending in task /14; do not treat the launcher commands below or
-examples from older documentation as working against this v2 daemon.
+The shared daemon speaks IPC protocol v2. The native Rust/rmcp stdio frontend
+(`serial-mcp`) now negotiates v2 and is the supported shared-app MCP frontend.
+It sends every device-specific operation through daemon IPC and does not own a
+tty directly. Normal launches run the prebuilt executable; they do not invoke
+Cargo or start a Python MCP frontend.
 
-The native human terminal also still speaks v1 and is incompatible; its migration
-is pending in task /15. See [human-terminal.md](human-terminal.md) for the
-explicit migration status and [daemon-ipc.md](daemon-ipc.md) for the current wire
-contract.
+The Python `serial_mcp_client.py` is retained as a legacy parity oracle for
+migration tests. It still speaks v1 and must reject the v2 daemon; it is not the
+installed or supported shared-app frontend. `server.py` / `serial-mcp-legacy`
+is a separate in-process adapter, not a client of the shared daemon. Do not run
+it concurrently with another process that owns the same serial device.
 
-The in-process legacy server (`serial-mcp-legacy`, `server.py`) is a separate
-adapter and is not a v2 daemon frontend. It remains available for its existing
-in-process use; do not use it concurrently with another process opening the same
-exclusive serial device.
+The native human terminal is being migrated separately in task /15. Until that
+migration lands, its v1 client is incompatible with the v2 daemon. See
+[human-terminal.md](human-terminal.md) for its current status.
 
-## Current daemon boundary
+## MCP tool behavior
 
-- The daemon owns independently opened physical tty devices, reader/output state,
-  client membership and per-device AI control. It is device-agnostic.
-- MCP callers use the daemon `call` operation, with an explicit port selector for
-  device-affecting tools. `connect(port, baudrate)` opens or joins a device and
-  requests control; a busy join becomes an observer. Modifying calls require the
-  current controller. See the v2 contract for the complete tool and permission
-  matrix.
-- Human clients join/leave without acquiring AI control. Input is ungated by AI
-  control; each client has independent output cursors. Human applications use
-  daemon IPC, not the legacy engine's tio socket or companion pty.
-- The daemon stays available while any client is registered. The last client's
-  departure starts a 30-second grace period; new clients cancel it.
+The Rust frontend exposes the shared-daemon catalog. Each device-scoped tool
+requires an explicit `port`; one MCP process can use multiple ports concurrently.
+`connect(port, baudrate)` joins or opens that device and requests control. A busy
+connect joins read-only and reports that control was not granted, the actual
+baudrate, and remaining lease time. Only an explicit `connect` can acquire or
+reacquire control. Modifying calls never take control implicitly, queue, or
+replay after an unknown outcome. `disconnect(port)` leaves only that device.
+
+The frontend removes the legacy `attach`, `tio_info`, and public lease tools,
+and exposes `set_baudrate(port, baudrate)`. There is no `attach_socket` or
+`session_socket` option in the shared app, and normal connects do not create a
+tio UNIX socket or companion pty. Baud changes and lease-loss/settings events
+are presented in the next response for the affected device. The frozen contract
+and complete tool authorization rules are documented in
+[daemon-ipc.md](daemon-ipc.md).
+
+The Rust tool catalog is generated from legacy metadata by
+`tools/export_tool_catalog.py`, with a deliberate shared-app v2 transformation.
+Run that script with `--check` to detect drift. The Python parity oracle's v1
+tool surface is intentionally not used as the shared-app catalog.
+
+## Build and packaging
+
+Build the native frontend once during installation or from a checkout:
+
+```bash
+cargo build --release --locked --manifest-path rust-client/Cargo.toml
+```
+
+The local executable is `rust-client/target/release/serial-mcp-rust-client`.
+The supported launch paths include `uvx --from <source> serial-mcp` and the Nix
+entrypoint. Source builds require Cargo and a Rust toolchain; ordinary native
+launches do not. The Python packaging trampoline only `exec`s the built native
+binary. The frontend is supported on Linux/WSL.
+
+## Daemon boundary and lifecycle
+
+- The daemon owns physical tty devices, readers, output state, memberships and
+  per-device AI control. It remains device-agnostic.
+- Human clients join and leave independently of AI control; their input is
+  ungated. Human applications use daemon IPC, not the legacy engine's tio socket
+  or companion pty.
+- Every registered MCP or human client keeps the daemon alive. The last client's
+  departure starts a 30-second shutdown grace; a new registration cancels it.
 - Runtime discovery uses `$SERIAL_MCP_RUNTIME_DIR`, then
   `$XDG_RUNTIME_DIR/serial-mcp`, then `/tmp/serial-mcp-<uid>`. The directory must
-  be private to the current user.
+  be a private directory owned by the current user.
 
-The frozen v2 framing, requests, events, errors, lease behavior, backpressure,
-limits and unknown-outcome rules are in [daemon-ipc.md](daemon-ipc.md). Frontend
-migration must update the client contract and its tests together; the Rust tool
-catalog and integrated Cargo gates are deliberately deferred to task /14.
+## Verification
 
-## Historical installation forms
-
-These commands still build or launch the v1 Rust executable, but **must not be
-used with the protocol-v2 daemon until task /14 completes its migration**:
-
-| Source | Command |
-|---|---|
-| GitHub | `uvx --from git+https://github.com/alvinla264/serial-mcp serial-mcp` |
-| Local checkout | Build with `cargo build --release --locked --manifest-path rust-client/Cargo.toml`, then run the built `serial-mcp-rust-client` executable |
-| Nix | `nix run github:alvinla264/serial-mcp` or `nix run /path/to/serial-mcp` |
-
-Source builds require Cargo and a Rust toolchain. Normal native launches do not
-invoke Cargo. These build details do not imply v2 compatibility.
-
-## Verification status
-
-Daemon and IPC behavior is tested with synthetic IPC clients and fake PTYs. The
-v1 frontend regression suites still describe the earlier contract and are not
-acceptance tests for protocol v2. The Rust frontend migration and combined Cargo
-checks remain for task /14; the native human terminal migration remains for task
-/15.
+The Rust frontend is tested over MCP stdio against isolated v2 daemons and fake
+PTYs, including multi-device routing, per-device control, settings notices,
+protocol mismatch and no-replay behavior. Cargo and Python test commands are
+listed in the repository development instructions. Tests never use real serial
+hardware.
