@@ -91,7 +91,7 @@ def test_first_client_auto_starts_one_daemon_and_is_connected(runtime):
     client = _ensure()
     try:
         client.hello(role="mcp", name="first")
-        assert client.status()["protocol"] == 1
+        assert client.status()["protocol"] == 2
         assert len(_daemon_pids_for(runtime)) == 1
     finally:
         client.close()
@@ -128,7 +128,7 @@ def test_stale_socket_file_is_recovered_under_the_lock(runtime):
     client = _ensure()
     try:
         client.hello(role="mcp", name="after-stale")
-        assert client.status()["protocol"] == 1
+        assert client.status()["protocol"] == 2
     finally:
         client.close()
         for pid in _daemon_pids_for(runtime):
@@ -224,24 +224,31 @@ def test_two_independent_clients_share_one_daemon_and_one_device_owner(runtime, 
         second.hello(role="mcp", name="agent-two")
         assert len(_daemon_pids_for(runtime)) == 1, "both clients must reach the same daemon"
 
-        assert first.call("connect", {"port": port, "session_socket": ""}).startswith("Connected")
-        assert second.status()["device"].startswith(port)
+        joined = first.call("connect", {"port": port, "baudrate": 115200})
+        observed = second.call("connect", {"port": port, "baudrate": 57600})
+        assert joined["control"] == "granted"
+        assert observed["control"] == "not_granted" and observed["baudrate"] == 115200
         with pytest.raises(ipc.DaemonError) as err:
-            second.call("send_command", {"text": "hi"})
+            second.call("send_command", {"port": port, "text": "hi"})
         assert err.value.code == "busy"
 
         first.close()
-        # Lease released by the exit (no operation was in flight): the other client takes over.
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 5
         while True:
             try:
-                reply = second.call("send_command", {"text": "ping", "timeout": 2, "idle_timeout": 0.2})
-                break
-            except ipc.DaemonError as exc:
-                if exc.code != "busy" or time.monotonic() > deadline:
+                second.call("send_command", {"port": port, "text": "ping"})
+            except ipc.DaemonError as err:
+                if err.code == "control_required":
+                    break
+                if err.code != "busy" or time.monotonic() >= deadline:
                     raise
+            else:
+                pytest.fail("observer call unexpectedly gained control")
+        grant = second.call("connect", {"port": port, "baudrate": 57600})
+        assert grant["control"] == "granted" and grant["baudrate"] == 115200
+        reply = second.call("send_command", {"port": port, "text": "ping", "timeout": 2, "idle_timeout": 0.2})
         assert reply.strip() == "PING"
-        assert second.call("disconnect").startswith("Disconnected")
+        second.call("disconnect", {"port": port})
     finally:
         stop.set()
         worker.join(timeout=2)
@@ -264,7 +271,7 @@ def test_a_second_daemon_cannot_take_over_a_live_endpoint(runtime):
         )
         assert proc.returncode == 0, proc.stderr
         assert os.stat(runtime / "daemon.sock").st_ino == before, "the live socket was replaced"
-        assert client.status()["protocol"] == 1, "the incumbent daemon stopped answering"
+        assert client.status()["protocol"] == 2, "the incumbent daemon stopped answering"
         assert len(_daemon_pids_for(runtime)) == 1
     finally:
         client.close()

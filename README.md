@@ -29,12 +29,15 @@ Notes:
 
 - Source-based `uvx` and pip installations compile the Rust frontend once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed Python console-script trampoline immediately replaces itself with the bundled native executable; it never invokes Cargo or Python's MCP framework during normal launches. Nix installs the binary directly.
 - Linux and WSL are the supported Rust frontend targets. FastMCP remains a dependency for the explicit `serial-mcp-legacy` in-process server; it is not the shared-daemon stdio frontend.
+- **Current migration caveat:** the Rust launcher and native terminal still speak
+  IPC v1 and fail against this branch's v2 daemon. Their migrations are pending
+  in tasks /14 and /15; do not use those frontends with this daemon yet.
 - `serial-mcp` is the Rust/rmcp stdio frontend of the shared daemon (see
-  [Shared daemon](#shared-daemon-protocol-v1)). The previous in-process server is
-  `serial-mcp-legacy` (`server.py`). Migration and setup: [docs/mcp-frontend.md](docs/mcp-frontend.md).
-- Tests: build the Rust frontend and run the full uv suite; the full Nix suite
-  also exercises the native frontend from the built package. Commands are in
-  [Frontend tests](docs/mcp-frontend.md#tests).
+  [Shared daemon](#shared-daemon-protocol-v2)). The previous in-process server is
+  `serial-mcp-legacy` (`server.py`). Status and setup: [docs/mcp-frontend.md](docs/mcp-frontend.md).
+- Current checks cover the daemon, engine and IPC with synthetic clients and PTYs.
+  Rust frontend integration and the combined Cargo gates are deferred until its
+  protocol-v2 migration in task /14; see [frontend status](docs/mcp-frontend.md).
 - Serial permissions still apply outside nix: your user needs `dialout` group
   membership (or udev rules) to open `/dev/ttyUSB0`.
 
@@ -460,54 +463,64 @@ to serial logs or the I/O transcript. The user still grants the agent access to
 the named local file and target path/address; review paths, target capabilities,
 and memory ranges before invoking a transfer.
 
-## Shared daemon (protocol v1)
+## Shared daemon (protocol v2)
 
-`serial-mcp-daemon` (`python -m serial_mcp_daemon`) is a per-user process that lets
-Pi and other coding agents share one serial device. It owns the single device
-connection, its reader and buffers, and runs the same tool implementations the MCP
-tools use. Clients talk to it over a permission-restricted UNIX socket
-(`$SERIAL_MCP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/serial-mcp`, else
-`/tmp/serial-mcp-<uid>`).
+Protocol v2 is a breaking multi-device IPC contract. The Rust MCP and native terminal
+frontends currently still speak v1 and reject this daemon; their migrations are
+pending in tasks /14 and /15. See [docs/daemon-ipc.md](docs/daemon-ipc.md) for the
+versioned wire contract.
 
-`serial-mcp` (the stdio launcher above) is a thin frontend of this daemon: each agent
-instance starts one, and it discovers or starts the daemon. Its tools match the
-legacy server, and it adds `lease_acquire`, `lease_release` and `lease_status` for
-explicit AI control. Setup, agent configuration, migration from the old launcher,
-lifecycle and error behaviour are in [docs/mcp-frontend.md](docs/mcp-frontend.md).
+`serial-mcp-daemon` (`python -m serial_mcp_daemon`) owns zero or more physical
+serial devices and shares them among local AI and human clients over a
+permission-restricted UNIX socket. Each physical tty has independent membership,
+output cursors, settings, operations, and an idle control lease. Device aliases
+resolve to the same tty identity. Runtime socket discovery uses
+`$SERIAL_MCP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/serial-mcp`, else
+`/tmp/serial-mcp-<uid>`.
 
-- Lifetime: the daemon stays up while any client connection is open. With no
-  clients it waits 30 seconds, drains in-flight work, releases the device and
-  exits. SIGTERM does the same.
-- Control: one control lease per device. The first gated tool call acquires it
-  automatically; another client gets `busy` with expiry information. The lease
-  expires after 60 idle seconds, and the former holder must acquire it again
-  explicitly (with a warning that device state may have changed). Read-only tools and
-  output observation never renew it.
-- Human terminals: a `human` client forwards raw input without lease gating and
-  receives device output independently of AI reads. Human connections keep the
-  daemon alive. Input is deliberately unrestricted; see the contract.
+The daemon speaks protocol v2. The Rust MCP frontend and native human terminal
+currently speak v1 and fail clearly during negotiation; migration is pending in
+tasks /14 and /15. The explicit in-process legacy server is separate. The v2
+contract and Python wire helpers (`serial_mcp_ipc`) are documented in
+[docs/daemon-ipc.md](docs/daemon-ipc.md).
 
-The complete frozen contract (frames, errors, lease rules, backpressure, limits)
-is in [docs/daemon-ipc.md](docs/daemon-ipc.md). Frontends should build on
-`serial_mcp_ipc` (`ensure_daemon`, `DaemonClient`), which is stdlib-only.
+- A registered client alone holds no device open. Membership joins keep a device
+  open until the last participant leaves; active work settles before closure.
+- `connect(port, baudrate)` opens/joins and requests control. First opener chooses
+  baud; later joins use the actual rate. Busy joins become read-only observers.
+  Only explicit `connect` acquires or reacquires control; modifications never
+  auto-acquire. Control expires after 60 idle seconds without ending membership.
+- Human clients join/leave without acquiring AI control. Human input is ungated,
+  and per-client output reads do not consume another client's cursor.
+- Every registered client keeps the daemon alive. When no clients remain, it
+  waits 30 seconds before shutdown.
+
+Frontends should use `serial_mcp_ipc` (`ensure_daemon`, `DaemonClient`), which is
+stdlib-only.
 
 ## Human terminal
 
-`serial-mcp-terminal` is an interactive console for you. It shows the device's live
+The checked-in `serial-mcp-terminal` still speaks v1 and exits during negotiation
+with this daemon; migration is pending in task /15. The following describes the
+target v2 terminal behavior, not the current executable.
+
+`serial-mcp-terminal` is intended to be an interactive console for you. It shows the device's live
 output and sends your keys straight to it, while MCP agents stay connected. Ctrl-]
 exits, locally and without sending it to the device. It holds no AI lease and it never
 opens the port. Install, usage, daemon lifetime effects, connect/disconnect semantics
 and the concurrent-input risk are in [docs/human-terminal.md](docs/human-terminal.md).
 
-## Session protocol notes
+## Legacy engine session surfaces
 
-One owner, any number of clients. The owner holds the serial port; clients join
-over a UNIX socket that speaks tio's `--socket` protocol (see tio
-`src/socket.c`) — raw bytes, no handshake or framing, so `nc -UN`, expect
-scripts, and tio itself can all join.
+The legacy in-process engine/server can still expose a tio-compatible socket and
+companion pty for its own direct-connect mode. The supported shared-daemon v2
+connection deliberately creates neither surface; human applications join through
+daemon IPC instead.
 
-**When this server owns the device** it serves that socket, and additionally
-exposes a companion pty so terminal tools can attach as if it were a real device:
+For the legacy engine only, one owner and any number of clients join over a UNIX
+socket speaking tio's `--socket` protocol (raw bytes, no handshake or framing).
+
+**When the legacy server owns the device** it may serve that socket and expose a companion pty:
 
 - **Companion pty** (`/tmp/serial-mcp-<dev>`, a symlink to a virtual tty): what
   `tio`, `screen`, `minicom`, `cat` attach to.

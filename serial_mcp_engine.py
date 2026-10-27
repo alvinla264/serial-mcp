@@ -309,6 +309,9 @@ class SerialState:
         self.write_lock = threading.Lock()
         self.io_lock = threading.RLock()
         self.operation_lock = threading.RLock()
+        # Baud changes are deliberately independent of operation_lock: an owner
+        # may change rates during a long operation or transfer.
+        self.baudrate_lock = threading.Lock()
         self.transfer_active = threading.Event()
         self._transfer_cleanup_paths: list[str] = []
         self._transfer_cleanup_command: str | None = None
@@ -393,6 +396,32 @@ class SerialState:
             self._write_rx_log_line_locked(self.log_rx_buffer)
             self.log_rx_buffer = ""
             self.log_rx_last_update = None
+
+    def set_baudrate(self, baudrate: int) -> str:
+        """Apply a baud change without waiting for a whole serial operation.
+
+        The transport driver is authoritative: update the mirrored value only
+        after its setter succeeds. This method sends no bytes.
+        """
+        if isinstance(baudrate, bool) or not isinstance(baudrate, int) or baudrate <= 0:
+            return "Error: baudrate must be a positive integer."
+        with self.baudrate_lock:
+            transport = self.transport
+            if transport is None or not transport.is_open:
+                return "Error: Not connected to a serial port."
+            try:
+                serial_handle = getattr(transport, "ser", None)
+                if serial_handle is None:
+                    return "Error: baudrate changes are unsupported by this transport."
+                serial_handle.baudrate = baudrate
+            except Exception as exc:
+                actual = getattr(serial_handle, "baudrate", getattr(transport, "baudrate", None))
+                if actual is not None:
+                    transport.baudrate = actual
+                return f"Error: could not set baudrate ({exc}); actual baudrate is {actual}."
+            actual = getattr(serial_handle, "baudrate", baudrate)
+            transport.baudrate = actual
+            return f"Baudrate set to {actual}."
 
     def _reader_loop(self) -> None:
         while not self.stop_event.is_set():

@@ -1,9 +1,13 @@
 # Human terminal (`serial-mcp-terminal`)
 
 `serial-mcp-terminal` is a plain interactive serial console for a human, built on
-the shared `serial-mcp` daemon. It works like `tio` or `minicom` with the device
-already open: you see the live output and every key goes straight to the device.
-While you are connected, AI agents on their MCP clients stay connected too.
+the shared `serial-mcp` daemon. This checkout's terminal still speaks IPC v1 and
+is incompatible with the breaking v2 daemon contract until task /15 migrates it;
+the daemon rejects v1 peers at version negotiation. **The remaining usage and
+lifecycle details below describe the intended migrated v2 terminal, not current
+behavior; the current executable exits at the protocol-version check.** The target
+v2 terminal works like `tio` or `minicom` with the device already open: live output
+and every key flow through daemon membership without acquiring AI control.
 
 It is deliberately thin. There is no configuration dashboard, no logging to a
 file, no scrollback, and no terminal emulation.

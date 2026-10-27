@@ -395,15 +395,36 @@ impl Daemon {
                         break;
                     }
                     if frame.get("v").and_then(Value::as_u64) != Some(PROTOCOL) {
-                        if let Some(id) = frame.get("id").and_then(Value::as_u64) {
-                            if let Some(tx) = weak
-                                .upgrade()
-                                .and_then(|this| this.pending.lock().unwrap().remove(&id))
-                            {
-                                let version = frame.get("v").unwrap_or(&Value::Null);
-                                let _ = tx.send(Err(format!(
-                                    "unsupported daemon protocol version {version}"
-                                )));
+                        let version = frame.get("v").unwrap_or(&Value::Null);
+                        let rejected = frame
+                            .get("error")
+                            .and_then(|error| error.get("code"))
+                            .and_then(Value::as_str)
+                            == Some("unsupported_version");
+                        let detail = frame
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str);
+                        let message = if rejected {
+                            format!(
+                                "daemon protocol mismatch: this frontend speaks protocol {PROTOCOL}; the daemon rejected that version{}",
+                                detail.map(|text| format!(": {text}")).unwrap_or_default()
+                            )
+                        } else {
+                            format!(
+                                "daemon protocol mismatch: daemon sent protocol version {version}; this frontend speaks protocol {PROTOCOL}"
+                            )
+                        };
+                        if let Some(this) = weak.upgrade() {
+                            let mut pending = this.pending.lock().unwrap();
+                            if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                                if let Some(tx) = pending.remove(&id) {
+                                    let _ = tx.send(Err(message));
+                                }
+                            } else if rejected {
+                                for (_, tx) in pending.drain() {
+                                    let _ = tx.send(Err(message.clone()));
+                                }
                             }
                         }
                         break;

@@ -27,6 +27,7 @@ from fastmcp.exceptions import ToolError
 import serial_mcp_ipc as ipc
 
 CLIENT_VERSION = "0.2.0"
+FRONTEND_PROTOCOL_VERSION = 1  # this frontend is retained only as a v1 compatibility oracle
 CALL_WAIT_SECONDS = 1860.0  # longest tool-level wait (1800 s transfer deadline) plus margin
 HELLO_ATTEMPTS = 3          # bounded retries when the daemon is shutting down during hello
 MAX_NOTICES = 20
@@ -110,11 +111,12 @@ class Frontend:
             except (ipc.DaemonUnavailable, TimeoutError) as exc:
                 client.close()
                 raise ToolError(f"serial-mcp daemon handshake failed: {exc}. {_runtime_hint()}") from None
-            if result.get("protocol") != ipc.PROTOCOL_VERSION:
+            if result.get("protocol") != FRONTEND_PROTOCOL_VERSION:
                 client.close()
                 raise ToolError(
                     f"serial-mcp daemon speaks protocol {result.get('protocol')!r}; this frontend "
-                    f"speaks {ipc.PROTOCOL_VERSION}. Stop the old daemon (SIGTERM) and retry. {_runtime_hint()}"
+                    f"speaks {FRONTEND_PROTOCOL_VERSION}; this daemon contract is breaking. "
+                    f"Migrate the frontend before using it with this daemon. {_runtime_hint()}"
                 )
             return client
         raise ToolError("the serial-mcp daemon kept shutting down during registration; try again")
