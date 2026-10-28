@@ -2,16 +2,13 @@
 
 A lightweight native Rust/rmcp stdio frontend for a shared Python serial daemon. It does not assume a specific device, shell, login flow, prompt, or command language. The daemon and human terminal remain Python; normal MCP launches run the built executable without starting Python/FastMCP frontend code. Wheel installs use a tiny Python console-script trampoline that immediately `exec`s the native executable.
 
-**Either side can own the device.** Serial ports cannot be shared, so one party
-holds the port and the other joins its session over a raw-byte UNIX socket:
-
-- **You own it** — run `tio -S unix:/tmp/serial-mcp-<dev>.sock <device>` and the
-  agent attaches to your session (`attach`). It cannot lock you out, and several
-  agent sessions can share the one device.
-- **The agent owns it** — it calls `connect(port=...)` and serves a session socket
-  plus a companion pty for your terminal tools to attach to. With the shared daemon
-  the port is held by the daemon for all agents, not by one agent process; see
-  [docs/mcp-frontend.md](docs/mcp-frontend.md).
+The shared application uses a per-user Python daemon and the native Rust MCP
+frontend. AI tools pass an explicit `port` to every device-scoped operation;
+several devices can be controlled independently. `connect(port, baudrate)` opens
+or joins a device and requests control. A busy connection joins read-only, and
+modifying operations require an explicit control-granting `connect`. The shared
+app does not expose raw tio sockets or companion ptys. The native human terminal
+is being migrated separately; see [docs/mcp-frontend.md](docs/mcp-frontend.md).
 
 Repo: https://github.com/alvinla264/serial-mcp
 
@@ -29,15 +26,15 @@ Notes:
 
 - Source-based `uvx` and pip installations compile the Rust frontend once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed Python console-script trampoline immediately replaces itself with the bundled native executable; it never invokes Cargo or Python's MCP framework during normal launches. Nix installs the binary directly.
 - Linux and WSL are the supported Rust frontend targets. FastMCP remains a dependency for the explicit `serial-mcp-legacy` in-process server; it is not the shared-daemon stdio frontend.
-- **Current migration caveat:** the Rust launcher and native terminal still speak
-  IPC v1 and fail against this branch's v2 daemon. Their migrations are pending
-  in tasks /14 and /15; do not use those frontends with this daemon yet.
+- The Rust launcher speaks daemon IPC v2. The Python parity oracle and native
+  human terminal still speak v1 and cannot be used as shared-daemon clients; the
+  terminal migration is pending in task /15.
 - `serial-mcp` is the Rust/rmcp stdio frontend of the shared daemon (see
   [Shared daemon](#shared-daemon-protocol-v2)). The previous in-process server is
   `serial-mcp-legacy` (`server.py`). Status and setup: [docs/mcp-frontend.md](docs/mcp-frontend.md).
-- Current checks cover the daemon, engine and IPC with synthetic clients and PTYs.
-  Rust frontend integration and the combined Cargo gates are deferred until its
-  protocol-v2 migration in task /14; see [frontend status](docs/mcp-frontend.md).
+- Rust frontend integration uses MCP stdio with isolated v2 daemons and fake
+  PTYs. Build and verification details are in
+  [frontend status](docs/mcp-frontend.md).
 - Serial permissions still apply outside nix: your user needs `dialout` group
   membership (or udev rules) to open `/dev/ttyUSB0`.
 
@@ -149,15 +146,17 @@ args = ["--from", "git+https://github.com/alvinla264/serial-mcp", "serial-mcp"]
 Reload with the `MCP: List Servers` command (or restart VS Code), then start
 Copilot Chat in agent mode and ask it to connect to the serial device.
 
-Then reload/restart the agent so it picks up the server, and tell it what you
-want — "attach to my serial session" (see below) or "connect to the serial
-device".
+Then reload/restart the agent so it picks up the server and ask it to connect
+to the serial device by its explicit port path. The shared app does not join
+tio sessions; human access uses the native terminal client when its v2 migration
+lands (task /15).
 
-### Two ways to share one device
+### Legacy standalone sessions (not shared-daemon mode)
 
-A serial port can only be held by one process, so either the **agent** or **you**
-owns it — and the other attaches to that session. Both directions use the same
-raw-byte tio socket protocol.
+The following raw-byte tio socket workflows and tool reference apply only to the
+legacy in-process adapter. They are not supported by the shared Rust application,
+which uses protocol v2 daemon IPC and has no `attach`, `attach_socket`,
+`session_socket`, or companion-pty route.
 
 #### You own it, the agent attaches (recommended)
 
@@ -238,7 +237,11 @@ Or poke the session directly (same raw protocol):
 > exempt: there your tio owns the port and the session paths, and any number of
 > agents can join it.
 
-## Tools
+## Legacy in-process tool reference
+
+This reference documents `serial-mcp-legacy` (`server.py`), not the shared Rust
+MCP frontend. Its single-device and tio-attach behavior is retained only for
+legacy users.
 
 - `connect(port=None, baudrate=115200, timeout=0.1, prompt_regex=None,
   session_socket="auto", attach_socket=None)`: opens the serial port (owning it),
