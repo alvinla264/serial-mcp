@@ -669,15 +669,20 @@ fn ensure_daemon() -> Result<Arc<Daemon>, String> {
             sock.display()
         ));
     }
-    let lock_path = dir.join("daemon.lock");
+    let lock_path = dir.join("daemon.start.lock");
     let started = Instant::now();
     let mut child: Option<Child> = None;
+    let mut spawn_lock: Option<fs::File> = None;
     let mut spawns = 0;
     loop {
-        if let Some(child_proc) = child.as_mut() {
-            if child_proc.try_wait().map_err(|e| e.to_string())?.is_some() {
-                child = None;
-            }
+        let child_exited = if let Some(child_proc) = child.as_mut() {
+            child_proc.try_wait().map_err(|e| e.to_string())?.is_some()
+        } else {
+            false
+        };
+        if child_exited {
+            child = None;
+            spawn_lock = None;
         }
         if let Ok(stream) = connect(&sock) {
             return Daemon::from_stream(stream, child);
@@ -689,23 +694,27 @@ fn ensure_daemon() -> Result<Arc<Daemon>, String> {
             ));
         }
         if child.is_none() && spawns < 3 {
-            let probe = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .map_err(|e| e.to_string())?;
-            let rc = unsafe {
-                libc::flock(
-                    std::os::fd::AsRawFd::as_raw_fd(&probe),
-                    libc::LOCK_EX | libc::LOCK_NB,
-                )
-            };
-            if rc == 0 {
-                unsafe {
-                    libc::flock(std::os::fd::AsRawFd::as_raw_fd(&probe), libc::LOCK_UN);
+            if spawn_lock.is_none() {
+                let probe = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .map_err(|e| e.to_string())?;
+                let rc = unsafe {
+                    libc::flock(
+                        std::os::fd::AsRawFd::as_raw_fd(&probe),
+                        libc::LOCK_EX | libc::LOCK_NB,
+                    )
+                };
+                if rc == 0 {
+                    // Hold the guard until the socket is reachable; dropping it after spawn
+                    // lets concurrent frontends launch duplicate daemons during startup.
+                    spawn_lock = Some(probe);
                 }
+            }
+            if spawn_lock.is_some() {
                 let mut cmd =
                     Command::new(std::env::var("PYTHON").unwrap_or_else(|_| "python3".into()));
                 cmd.args(["-m", "serial_mcp_daemon"])

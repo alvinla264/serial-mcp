@@ -21,8 +21,7 @@ import serial_mcp_client as python_oracle
 import server as legacy
 from tools.export_tool_catalog import _fastmcp2_metadata
 from test_mcp_client import (
-    ScriptedDaemon, _daemon_pids_for, _echo_upper, _hello_result, _pty_device,
-    _release_device, _reply, daemon, echo_device, real_runtime,
+    ScriptedDaemon, _daemon_pids_for, _hello_result, _pty_device, _reply, real_runtime,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -111,6 +110,7 @@ def test_rust_global_tools_dispatch_through_real_daemon(real_runtime, tmp_path, 
             assert json.loads(path.read_text())["synthetic-profile"]["password"] == "synthetic-secret"
             bad = await client.call_tool("set_boot_credentials", {"password": "x"}, raise_on_error=False)
             assert bad.is_error and "unknown_tool" not in text_of(bad)
+            assert len(_daemon_pids_for(real_runtime)) == 1
 
     asyncio.run(scenario())
 
@@ -191,7 +191,7 @@ def test_rust_v2_routes_tools_to_multiple_devices_with_independent_control(real_
             os.close(device[0])
 
 
-def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(daemon, real_runtime):
+def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(real_runtime):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
     started = threading.Event()
@@ -203,7 +203,13 @@ def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(daemon, 
             readable, _, _ = select.select([master], [], [], 0.05)
             if master not in readable:
                 continue
-            payload = os.read(master, 1024)
+            try:
+                payload = os.read(master, 1024)
+            except OSError as exc:
+                if exc.errno == 5:  # PTY master reports EIO until the daemon opens its slave.
+                    stop.wait(0.02)
+                    continue
+                raise
             started.set()
             if not release.wait(4):
                 return
@@ -211,11 +217,13 @@ def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(daemon, 
             return
 
     device = _pty_device(delayed_echo)
+    os.close(device[1])  # Only the daemon subprocess may hold the slave.
 
     async def scenario():
         async with Client(transport(real_runtime, "rust-inflight-baud")) as client:
             joined = await client.call_tool("connect", {"port": device[2], "baudrate": 115200})
             assert not joined.is_error, text_of(joined)
+            assert len(_daemon_pids_for(real_runtime)) == 1
             inflight = asyncio.create_task(client.call_tool(
                 "send_command", {"port": device[2], "text": "held", "timeout": 4}
             ))
@@ -231,7 +239,9 @@ def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(daemon, 
         asyncio.run(scenario())
     finally:
         release.set()
-        _release_device(*device[:2], device[3], device[4])
+        device[3].set()
+        device[4].join(timeout=2)
+        os.close(device[0])
 
 
 def test_rust_local_source_build_starts_daemon_outside_repository_cwd(tmp_path):
@@ -299,9 +309,25 @@ def test_rust_local_source_build_starts_daemon_outside_repository_cwd(tmp_path):
         frontend.stderr.close()
 
 
-def test_rust_process_crash_releases_all_device_memberships(daemon, real_runtime, echo_device):
+def test_rust_process_crash_releases_all_device_memberships(real_runtime):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
+    def echo_until_daemon_opens(master, stop):
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master not in readable:
+                continue
+            try:
+                payload = os.read(master, 1024)
+            except OSError as exc:
+                if exc.errno == 5:
+                    stop.wait(0.02)
+                    continue
+                raise
+            os.write(master, payload.upper())
+
+    echo_device = _pty_device(echo_until_daemon_opens)
+    os.close(echo_device[1])  # Keep pytest from impersonating the device owner.
     env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(real_runtime),
                SERIAL_MCP_CLIENT_NAME="rust-crash-owner", PYTHONPATH=str(ROOT))
     frontend = subprocess.Popen(
@@ -330,6 +356,7 @@ def test_rust_process_crash_releases_all_device_memberships(daemon, real_runtime
             "name":"connect", "arguments":{"port":echo_device[2], "baudrate":115200}}})
         connected = receive(2)
         assert not connected["result"]["isError"], connected
+        assert len(_daemon_pids_for(real_runtime)) == 1
         assert "Control granted" in "".join(x.get("text", "") for x in connected["result"]["content"])
         frontend.kill()
         frontend.wait(timeout=5)
@@ -353,6 +380,9 @@ def test_rust_process_crash_releases_all_device_memberships(daemon, real_runtime
         if frontend is not None and frontend.poll() is None:
             frontend.kill()
             frontend.wait(timeout=5)
+        echo_device[3].set()
+        echo_device[4].join(timeout=2)
+        os.close(echo_device[0])
 
 
 def test_rust_registers_daemon_during_idle_startup(tmp_path):
@@ -709,15 +739,18 @@ def test_rust_frontend_autostarts_daemon_without_fastmcp_or_legacy_server(tmp_pa
         assert not _daemon_pids_for(runtime), "isolated test daemon did not stop"
 
 
-def test_multiple_rust_clients_register_with_the_v2_daemon(daemon, real_runtime):
+def test_multiple_rust_clients_register_with_the_v2_daemon(real_runtime):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
 
     async def scenario():
         async with Client(transport(real_runtime, "rust-one")) as first:
             async with Client(transport(real_runtime, "rust-two")) as second:
-                for client in (first, second):
-                    result = await client.call_tool("file_transfer_capabilities", {}, raise_on_error=False)
-                    assert not result.is_error, text_of(result)
+                results = await asyncio.gather(
+                    first.call_tool("file_transfer_capabilities", {}, raise_on_error=False),
+                    second.call_tool("file_transfer_capabilities", {}, raise_on_error=False),
+                )
+                assert all(not result.is_error for result in results), [text_of(r) for r in results]
+                assert len(_daemon_pids_for(real_runtime)) == 1
 
     asyncio.run(scenario())

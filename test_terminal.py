@@ -1,5 +1,6 @@
 """Public IPC/pty smoke coverage for the multi-device terminal list and exit."""
 import base64
+import contextlib
 import os
 import pty
 import select
@@ -21,6 +22,49 @@ import serial_mcp_ipc as ipc
 import serial_mcp_terminal as terminal
 
 ROOT = Path(__file__).resolve().parent
+
+
+@contextlib.contextmanager
+def _running_real_terminal(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    state = serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
+    daemon = serial_mcp_daemon.DaemonServer(runtime, state=state)
+    daemon.start()
+    human_master, human_slave = pty.openpty()
+    initial_tty = termios.tcgetattr(human_slave)
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime),
+               PYTHONPATH=str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "serial_mcp_terminal"], cwd=ROOT, env=env,
+        stdin=human_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    os.close(human_slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=5, start=0):
+        deadline = time.monotonic() + timeout
+        while needle not in output[start:] and time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stderr], [], [], 0.1)
+            if readable:
+                chunk = os.read(process.stderr.fileno(), 4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+        assert needle in output[start:], output.decode("utf-8", "replace")[-2000:]
+
+    try:
+        yield runtime, state, daemon, human_master, initial_tty, process, output, wait_for
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        daemon.stop("test complete")
+        os.close(human_master)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
 
 def test_terminal_output_retries_partial_writes(monkeypatch):
@@ -482,6 +526,133 @@ def test_terminal_reports_unavailable_port_and_returns_to_the_list(tmp_path, mon
             process.wait(timeout=5)
         daemon.stop("test complete")
         os.close(human_master)
+
+
+def test_terminal_real_daemon_not_connected_input_returns_to_device_list(tmp_path, monkeypatch):
+    device_master, device_slave = pty.openpty()
+    port = os.ttyname(device_slave)
+    os.close(device_slave)
+    monkeypatch.setattr(
+        serial_mcp_engine.serial.tools.list_ports,
+        "comports",
+        lambda: [type("Port", (), {"device": port, "description": "synthetic", "hwid": ""})()],
+    )
+    with _running_real_terminal(tmp_path) as (_, state, _, human_master, _, process, output, wait_for):
+        try:
+            wait_for(port.encode())
+            os.write(human_master, b"\r")
+            wait_for(b"Baud rate (e.g. 115200): ")
+            os.write(human_master, b"115200\r")
+            wait_for(b"Ctrl-] returns to device list")
+            os.close(device_master)
+            deadline = time.monotonic() + 3
+            while state.transport is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert state.transport is None, "fake serial reader did not observe device loss"
+            mark = len(output)
+            os.write(human_master, b"x")
+            wait_for(b"[device disconnected:", start=mark)
+            wait_for(b"device list", start=mark)
+            assert process.poll() is None
+            os.write(human_master, b"q")
+            assert process.wait(timeout=5) == 0
+        finally:
+            if process.poll() is None:
+                os.write(human_master, b"q")
+            try:
+                os.close(device_master)
+            except OSError:
+                pass
+
+
+def test_terminal_real_daemon_disconnect_event_returns_to_list(tmp_path, monkeypatch):
+    device_master, device_slave = pty.openpty()
+    target = os.ttyname(device_slave)
+    alias = tmp_path / "serial-alias"
+    os.symlink(target, alias)
+    os.close(device_slave)
+    port = str(alias)
+    monkeypatch.setattr(
+        serial_mcp_engine.serial.tools.list_ports,
+        "comports",
+        lambda: [type("Port", (), {"device": port, "description": "synthetic", "hwid": ""})()],
+    )
+    with _running_real_terminal(tmp_path) as (runtime, state, _, human_master, _, process, output, wait_for):
+        ai = ipc.DaemonClient.connect(runtime / "daemon.sock")
+        try:
+            ai.hello(role="mcp", name="disconnect-observer")
+            wait_for(port.encode())
+            os.write(human_master, b"\r")
+            wait_for(b"Baud rate (e.g. 115200): ")
+            os.write(human_master, b"115200\r")
+            wait_for(b"Ctrl-] returns to device list")
+            os.close(device_master)
+            deadline = time.monotonic() + 3
+            while state.transport is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert state.transport is None, "fake serial reader did not observe device loss"
+            alias.unlink()
+            ai.status()  # Real daemon detects the missing tty and broadcasts disconnected.
+            wait_for(b"[device disconnected; returned to device list]")
+            wait_for(b"device list")
+            assert process.poll() is None
+            os.write(human_master, b"q")
+            assert process.wait(timeout=5) == 0
+        finally:
+            ai.close()
+            try:
+                alias.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                os.close(device_master)
+            except OSError:
+                pass
+
+
+def test_terminal_clamps_selection_when_device_list_shrinks(tmp_path, monkeypatch):
+    masters = []
+    ports = []
+    for _ in range(2):
+        master, slave = pty.openpty()
+        masters.append(master)
+        port = os.ttyname(slave)
+        os.close(slave)
+        ports.append(port)
+    available = list(ports)
+
+    def comports():
+        return [type("Port", (), {"device": port, "description": "synthetic", "hwid": ""})()
+                for port in available]
+
+    monkeypatch.setattr(serial_mcp_engine.serial.tools.list_ports, "comports", comports)
+    with _running_real_terminal(tmp_path) as (_, _, _, human_master, _, process, output, wait_for):
+        try:
+            wait_for(ports[0].encode())
+            wait_for(ports[1].encode())
+            os.write(human_master, b"j")
+            available[:] = ports[:1]
+            mark = len(output)
+            wait_for(f"> {ports[0]}".encode(), start=mark, timeout=4)
+            os.write(human_master, b"\r")
+            wait_for(b"Baud rate (e.g. 115200): ")
+            os.write(human_master, b"115200\r")
+            wait_for(b"Ctrl-] returns to device list")
+            assert ports[1].encode() not in output[mark:]
+            assert process.poll() is None
+            mark = len(output)
+            os.write(human_master, b"\x1d")
+            wait_for(b"device list", start=mark)
+            os.write(human_master, b"q")
+            assert process.wait(timeout=5) == 0
+        finally:
+            if process.poll() is None:
+                os.write(human_master, b"q")
+            for master in masters:
+                try:
+                    os.close(master)
+                except OSError:
+                    pass
 
 
 def test_terminal_disconnect_event_returns_to_list_without_failing_app():
