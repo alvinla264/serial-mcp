@@ -503,15 +503,12 @@ stdlib-only.
 
 ## Human terminal
 
-The checked-in `serial-mcp-terminal` still speaks v1 and exits during negotiation
-with this daemon; migration is pending in task /15. The following describes the
-target v2 terminal behavior, not the current executable.
-
-`serial-mcp-terminal` is intended to be an interactive console for you. It shows the device's live
-output and sends your keys straight to it, while MCP agents stay connected. Ctrl-]
-exits, locally and without sending it to the device. It holds no AI lease and it never
-opens the port. Install, usage, daemon lifetime effects, connect/disconnect semantics
-and the concurrent-input risk are in [docs/human-terminal.md](docs/human-terminal.md).
+`serial-mcp-terminal` is a native multi-device TUI for humans. It lists available
+ports, displays the registered MCP-client count and per-device status, and joins a
+selected device without acquiring an AI lease. Ctrl-] leaves the current pane;
+Ctrl-Q quits the app. Install and usage details, lifecycle semantics and accepted
+concurrent-input/baud-interference risks are in
+[docs/human-terminal.md](docs/human-terminal.md).
 
 ## Legacy engine session surfaces
 

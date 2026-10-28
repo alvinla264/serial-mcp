@@ -760,11 +760,13 @@ class DaemonServer:
                 return None
             self._clients.add(conn)
             self._grace_started = None
+            count = len(self._clients)
+            mcp_count = sum(client.role == "mcp" for client in self._clients)
             result = {"protocol": PROTOCOL_VERSION, "daemon_version": DAEMON_VERSION,
                       "client_id": conn.cid, "role": conn.role,
-                      "devices": self._device_snapshots_locked(), "clients": len(self._clients)}
-            count = len(self._clients)
-        self._broadcast_count(count)
+                      "devices": self._device_snapshots_locked(), "clients": count,
+                      "mcp_clients": mcp_count}
+        self._broadcast_count(count, mcp_count)
         return result
 
     def unregister(self, conn: Connection) -> None:
@@ -777,13 +779,14 @@ class DaemonServer:
             if not self._clients and not self._shutting_down:
                 self._grace_started = self.clock()
             count = len(self._clients)
+            mcp_count = sum(client.role == "mcp" for client in self._clients)
             self._drained.notify_all()
         deadline = (self._shutdown_deadline if self._shutting_down
                     and self._shutdown_deadline is not None
                     else time.monotonic() + DRAIN_TIMEOUT_SECONDS)
         for device in memberships:
             self._leave_device(conn, device, deadline=deadline)
-        self._broadcast_count(count)
+        self._broadcast_count(count, mcp_count)
 
     def status(self, viewer: Connection | None = None) -> dict:
         with self._lock:
@@ -795,13 +798,14 @@ class DaemonServer:
                 "daemon_version": DAEMON_VERSION,
                 "protocol": PROTOCOL_VERSION,
                 "clients": len(self._clients),
+                "mcp_clients": sum(client.role == "mcp" for client in self._clients),
                 "grace": {"active": grace_remaining is not None, "remaining": grace_remaining},
                 "shutting_down": self._shutting_down,
                 "devices": self._device_snapshots_locked(),
             }
 
-    def _broadcast_count(self, count: int) -> None:
-        frame = {"event": "clients", "clients": count}
+    def _broadcast_count(self, count: int, mcp_count: int) -> None:
+        frame = {"event": "clients", "clients": count, "mcp_clients": mcp_count}
         with self._lock:
             clients = list(self._clients)
         for conn in clients:
