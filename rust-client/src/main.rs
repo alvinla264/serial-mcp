@@ -948,6 +948,40 @@ mod tests {
     }
 
     #[test]
+    fn notices_remain_bounded_and_surface_coalescing_and_settings_gap() {
+        let frontend = Frontend::new();
+        frontend
+            .port_devices
+            .lock()
+            .unwrap()
+            .insert("/dev/synthetic".into(), "device-1".into());
+        for index in 0..100 {
+            frontend.notice("device-1", &format!("settings update {index}"));
+        }
+        let queue = frontend.notices.lock().unwrap();
+        assert!(queue["device-1"].len() <= 32);
+        assert!(queue["device-1"]
+            .iter()
+            .any(|notice| notice.contains("coalesced")));
+        drop(queue);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let daemon = Arc::new(Daemon {
+            writer: Mutex::new(stream),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            _child: None,
+            events: Mutex::new(vec![json!({
+                "event":"settings_gap", "device_id":"device-1"
+            })]),
+        });
+        assert!(frontend.drain_events(&daemon));
+        let result = frontend.prefix(Some("/dev/synthetic"), "tool result".into());
+        assert!(result.contains("NOTICE: settings notices coalesced"));
+        assert!(result.ends_with("tool result"));
+    }
+
+    #[test]
     fn runtime_directory_creation_is_private_and_rejects_symlinks_or_open_modes() {
         let root =
             std::env::temp_dir().join(format!("serial-mcp-runtime-test-{}", std::process::id()));

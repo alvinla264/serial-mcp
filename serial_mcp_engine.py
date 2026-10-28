@@ -2876,7 +2876,8 @@ class SerialState:
 
     def set_boot_credentials(self, profile_key: str, username: str, password: str) -> str:
         """Store login credentials locally (gitignored, mode 0600). Never logged."""
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(CONFIG_DIR, 0o700)
         try:
             creds = _load_json_file(CREDENTIALS_PATH)
             creds[profile_key] = {"username": username, "password": password}

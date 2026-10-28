@@ -24,7 +24,7 @@ Run from a real terminal (stdin must be a tty). The app starts or joins the per-
 | Ctrl-Q in list | Quit; not sent |
 | Any other pane input | Sent immediately and without local echo, including Ctrl-C, Ctrl-Z, and arrow keys |
 
-The terminal uses raw mode in a pane and restores the previous tty settings on normal exit and handled SIGTERM/SIGHUP/SIGINT. Diagnostics/status appear on stderr; received device bytes are written to stdout. The interface has no terminal emulation or scrollback. Output and daemon event queues are bounded; visible gap events report dropped output/events. On daemon loss the app exits rather than reconnecting. Exit code is 2 if stdin is not a tty, 1 for daemon failure, and 0 on normal quit.
+The terminal uses raw mode in a pane and restores the previous tty settings on normal exit and handled SIGTERM/SIGHUP/SIGINT. A handled signal exits with 130 (SIGINT's conventional status); diagnostics/status appear on stderr, and received device bytes are written to stdout. The interface has no terminal emulation or scrollback. Output and daemon event queues are bounded; visible gap events report dropped output/events. On daemon loss the app exits rather than reconnecting. Exit code is 2 if stdin is not a tty, 1 for daemon failure, 0 on normal quit, or 130 after a handled signal.
 
 ## Ownership and concurrent input
 

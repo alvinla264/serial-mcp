@@ -468,10 +468,9 @@ and memory ranges before invoking a transfer.
 
 ## Shared daemon (protocol v2)
 
-Protocol v2 is a breaking multi-device IPC contract. The Rust MCP and native terminal
-frontends currently still speak v1 and reject this daemon; their migrations are
-pending in tasks /14 and /15. See [docs/daemon-ipc.md](docs/daemon-ipc.md) for the
-versioned wire contract.
+Protocol v2 is a breaking multi-device IPC contract. The Rust MCP frontend and
+native terminal both speak v2. See [docs/daemon-ipc.md](docs/daemon-ipc.md) for
+the versioned wire contract and supported global/device tool scope.
 
 `serial-mcp-daemon` (`python -m serial_mcp_daemon`) owns zero or more physical
 serial devices and shares them among local AI and human clients over a

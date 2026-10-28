@@ -71,11 +71,70 @@ def transport(runtime: Path, name: str) -> StdioTransport:
              "PYTHONPATH": str(ROOT)}, cwd=str(ROOT), keep_alive=False)
 
 
-def test_rust_v2_routes_tools_to_multiple_devices_with_independent_control(daemon, real_runtime, tmp_path):
+def test_rust_global_tools_dispatch_through_real_daemon(real_runtime, tmp_path, monkeypatch):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    home = tmp_path / "home"
+    config = home / ".config" / "serial-mcp"
+    config.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+    async def scenario():
+        async with Client(transport(real_runtime, "rust-global")) as client:
+            catalog = json.loads((ROOT / "rust-client/tools.json").read_text())
+            assert len(await client.list_tools()) == 16
+            for tool in catalog:
+                name = tool["name"]
+                required = tool["inputSchema"].get("required", [])
+                args = {}
+                for key in required:
+                    if key == "port":
+                        args[key] = "/dev/serial-mcp-missing"
+                    elif key == "baudrate":
+                        args[key] = 115200
+                    else:
+                        args[key] = "synthetic-value"
+                result = await client.call_tool(name, args, raise_on_error=False)
+                assert "unknown_tool" not in text_of(result), (name, text_of(result))
+            profiles = await client.call_tool("list_boot_profiles", {})
+            assert not profiles.is_error, text_of(profiles)
+            assert "unknown_tool" not in text_of(profiles)
+            ports = await client.call_tool("list_serial_ports", {})
+            assert not ports.is_error and "unknown_tool" not in text_of(ports)
+            stored = await client.call_tool("set_boot_credentials", {
+                "profile_key": "synthetic-profile", "username": "synthetic-user",
+                "password": "synthetic-secret"})
+            assert not stored.is_error and "synthetic-secret" not in text_of(stored)
+            path = config / "credentials.json"
+            assert path.exists() and path.stat().st_mode & 0o777 == 0o600
+            assert json.loads(path.read_text())["synthetic-profile"]["password"] == "synthetic-secret"
+            bad = await client.call_tool("set_boot_credentials", {"password": "x"}, raise_on_error=False)
+            assert bad.is_error and "unknown_tool" not in text_of(bad)
+
+    asyncio.run(scenario())
+
+
+def test_rust_v2_routes_tools_to_multiple_devices_with_independent_control(real_runtime, tmp_path):
     if not BINARY.is_file():
         pytest.skip("build rust-client first; tests always exercise the built executable, never cargo at launch")
-    first = _pty_device(_echo_upper)
-    second = _pty_device(_echo_upper)
+    def subprocess_echo(master, stop):
+        while not stop.is_set():
+            try:
+                readable, _, _ = select.select([master], [], [], 0.05)
+                if readable:
+                    os.write(master, os.read(master, 1024).upper())
+            except OSError as exc:
+                if exc.errno != 5:
+                    raise
+                time.sleep(0.01)
+
+    first = _pty_device(subprocess_echo)
+    second = _pty_device(subprocess_echo)
+    # Keep only each master as the fake device; the setup slave would look like
+    # an unrelated holder to the real daemon's ownership safety scan.
+    os.close(first[1])
+    os.close(second[1])
     alias = tmp_path / "serial-alias"
     alias.symlink_to(first[2])
 
@@ -126,8 +185,10 @@ def test_rust_v2_routes_tools_to_multiple_devices_with_independent_control(daemo
     try:
         asyncio.run(scenario())
     finally:
-        _release_device(*first[:2], first[3], first[4])
-        _release_device(*second[:2], second[3], second[4])
+        for device in (first, second):
+            device[3].set()
+            device[4].join(timeout=2)
+            os.close(device[0])
 
 
 def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(daemon, real_runtime):

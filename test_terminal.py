@@ -23,6 +23,17 @@ import serial_mcp_terminal as terminal
 ROOT = Path(__file__).resolve().parent
 
 
+def test_terminal_output_retries_partial_writes(monkeypatch):
+    chunks = []
+    def partial(fd, data):
+        piece = bytes(data[:2])
+        chunks.append(piece)
+        return len(piece)
+    monkeypatch.setattr(terminal.os, "write", partial)
+    terminal._write_bytes(123, b"abcdef")
+    assert b"".join(chunks) == b"abcdef"
+
+
 @pytest.mark.parametrize("has_mcp_count", [True, False])
 def test_terminal_requires_mcp_count_and_hides_client_identity(tmp_path, has_mcp_count):
     runtime = tmp_path / "runtime"
@@ -471,6 +482,32 @@ def test_terminal_reports_unavailable_port_and_returns_to_the_list(tmp_path, mon
             process.wait(timeout=5)
         daemon.stop("test complete")
         os.close(human_master)
+
+
+def test_terminal_disconnect_event_returns_to_list_without_failing_app():
+    terminal_master, terminal_slave = pty.openpty()
+    tty.setraw(terminal_slave)
+    output_read, output_write = os.pipe()
+
+    class Events:
+        calls = 0
+        def next_event(self, timeout=0):
+            self.calls += 1
+            if self.calls == 1:
+                return {"event": "device", "state": "disconnected", "port": "/dev/synthetic"}
+            if self.calls == 2:
+                os.write(terminal_master, b"\x1d")
+            return None
+
+    try:
+        assert terminal._terminal_pane(Events(), "/dev/synthetic", 115200,
+                                       terminal_slave, output_write) == 0
+        assert b"device disconnected" in os.read(output_read, 4096)
+    finally:
+        os.close(terminal_master)
+        os.close(terminal_slave)
+        os.close(output_read)
+        os.close(output_write)
 
 
 @pytest.mark.parametrize(

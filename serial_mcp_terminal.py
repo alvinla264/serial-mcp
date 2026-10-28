@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import os
 import select
 import signal
@@ -27,11 +28,31 @@ MAX_SCREEN_ROWS = 80
 def _write(fd: int, text: str) -> None:
     data = text.encode("utf-8", "replace")
     view = memoryview(data)
+    attempts = 0
     while view:
-        view = view[os.write(fd, view):]
+        attempts += 1
+        if attempts > 64:
+            raise OSError("terminal write made insufficient progress")
+        written = os.write(fd, view)
+        if written <= 0:
+            raise BrokenPipeError("terminal output is closed")
+        view = view[written:]
 
 
-def _baud_input(fd: int, out_fd: int, err_fd: int) -> int | None:
+def _write_bytes(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    attempts = 0
+    while view:
+        attempts += 1
+        if attempts > 64:
+            raise OSError("terminal write made insufficient progress")
+        written = os.write(fd, view)
+        if written <= 0:
+            raise BrokenPipeError("terminal output is closed")
+        view = view[written:]
+
+
+def _baud_input(fd: int, err_fd: int) -> int | None:
     """Read a bounded line in raw mode; reject malformed/out-of-range baudrates."""
     _write(err_fd, "Baud rate (e.g. 115200): ")
     chars = bytearray()
@@ -84,6 +105,7 @@ def _device_list(client: ipc.DaemonClient, fd: int, err_fd: int) -> int:
         known = ([{"port": line.split(None, 1)[0]} for line in ports.splitlines()
                   if line.strip() and not line.startswith("No serial ports found")]
                  if isinstance(ports, str) else [])
+        selected = min(selected, max(0, min(len(known), MAX_SCREEN_ROWS) - 1))
         _write(err_fd, "\x1b[H\x1b[2Jserial-mcp-terminal — device list (↑/↓ select, Enter join, q quit)\r\n")
         _write(err_fd, f"Registered MCP clients: {mcp_clients}\r\n\r\n")
         if not known:
@@ -108,23 +130,34 @@ def _device_list(client: ipc.DaemonClient, fd: int, err_fd: int) -> int:
         if b"\x1b[A" in key or key == b"k":
             selected = max(0, selected - 1)
         elif b"\x1b[B" in key or key == b"j":
-            selected = min(max(0, len(known) - 1), selected + 1)
+            selected = min(max(0, min(len(known), MAX_SCREEN_ROWS) - 1), selected + 1)
         elif b"\r" in key or b"\n" in key:
             if not known:
+                continue
+            if selected >= len(known) or selected >= MAX_SCREEN_ROWS:
+                selected = max(0, min(len(known), MAX_SCREEN_ROWS) - 1)
                 continue
             item = known[selected]
             port = item.get("port") if isinstance(item, dict) else str(item)
             current = by_port.get(port)
             baud = None
             if not current or current.get("state") != "connected":
-                baud = _baud_input(fd, err_fd, err_fd)
+                baud = _baud_input(fd, err_fd)
                 if baud is None:
                     continue
             try:
                 joined = client.join(port, baud)
-                client.subscribe(port)
             except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError) as exc:
                 _write(err_fd, f"serial-mcp-terminal: cannot join {port}: {exc}\r\n")
+                continue
+            try:
+                client.subscribe(port)
+            except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError) as exc:
+                try:
+                    client.leave(port)
+                except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError):
+                    pass
+                _write(err_fd, f"serial-mcp-terminal: joined {port} but could not subscribe to output: {exc}\r\n")
                 continue
             result = _terminal_pane(client, port, joined.get("baudrate"), fd, err_fd)
             try:
@@ -153,18 +186,31 @@ def _terminal_pane(client: ipc.DaemonClient, port: str, baud: int | None,
                 return 0
             try:
                 client.human_input(data, port)
-            except (ipc.DaemonError, ipc.DaemonUnavailable, TimeoutError) as exc:
+            except ipc.DaemonError as exc:
+                if exc.code == "not_connected":
+                    _write(err_fd, f"\r\n[device disconnected: {exc}]\r\n")
+                    return 0
+                _write(err_fd, f"\r\nserial-mcp-terminal: input failed: {exc}\r\n")
+                return 1
+            except (ipc.DaemonUnavailable, TimeoutError) as exc:
                 _write(err_fd, f"\r\nserial-mcp-terminal: input failed: {exc}\r\n")
                 return 1
         while True:
             event = client.next_event(timeout=0)
             if event is None:
                 break
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                _write(err_fd, "\r\n[ignored malformed daemon event]\r\n")
+                continue
             if event.get("event") == "output" and event.get("port") == port:
                 try:
-                    os.write(sys.stdout.fileno(), base64.b64decode(event["data"], validate=True))
-                except OSError:
+                    _write_bytes(sys.stdout.fileno(), base64.b64decode(event["data"], validate=True))
+                except (OSError, binascii.Error):
+                    _write(err_fd, "\r\nserial-mcp-terminal: malformed device output or closed terminal\r\n")
                     return 1
+            elif event.get("event") == "device" and event.get("port") == port and event.get("state") == "disconnected":
+                _write(err_fd, "\r\n[device disconnected; returned to device list]\r\n")
+                return 0
             elif event.get("event") == "settings" and event.get("port") == port:
                 baud = event.get("baudrate", baud)
                 _write(err_fd, f"\r\n[baud rate changed to {baud}; concurrent output may be affected]\r\n")
@@ -218,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         return _device_list(client, fd, sys.stderr.fileno())
     except KeyboardInterrupt:
         return 128 + signal.SIGINT
+    except (BrokenPipeError, OSError):
+        return 1
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, settings)
         for sig, handler in old_handlers.items():

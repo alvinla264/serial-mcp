@@ -102,9 +102,14 @@ AI tools include `send_command`, `read_output`, `clear_output`,
 `set_prompt_pattern`, `login`, `enter_bootloader`, `upload_file`,
 `download_file`, `view_io`, `set_baudrate`, and `file_transfer_capabilities`.
 `connect`, `disconnect`, and `set_baudrate` have daemon-owned semantics above.
-Legacy attach/tio/session-socket controls, `tio_info`, list/profile/credential
-utilities and public lease acquire/release/status are not exposed in the shared
-application. Tools not defined here return `unknown_tool`.
+Legacy attach/tio/session-socket controls, `tio_info`, and public lease
+acquire/release/status are not exposed in the shared application. The MCP role
+exposes the 16-tool catalog in `rust-client/tools.json`. Device-scoped tools
+require explicit `port`; `file_transfer_capabilities`, `list_serial_ports`, and
+`list_boot_profiles` are global and require no device membership or lease.
+`set_boot_credentials` is also global, MCP-only, and writes only to the protected
+user credential store (mode 0600); secrets are never returned or logged. Global
+tools reject unexpected arguments. Tools not defined here return `unknown_tool`.
 
 ## Permissions, lease, operation concurrency
 
