@@ -594,7 +594,8 @@ def test_terminal_real_daemon_disconnect_event_returns_to_list(tmp_path, monkeyp
             alias.unlink()
             ai.status()  # Real daemon detects the missing tty and broadcasts disconnected.
             wait_for(b"[device disconnected; returned to device list]")
-            wait_for(b"device list")
+            mark = len(output)
+            wait_for(b"device list", start=mark)
             assert process.poll() is None
             os.write(human_master, b"q")
             assert process.wait(timeout=5) == 0
@@ -637,7 +638,8 @@ def test_terminal_clamps_selection_when_device_list_shrinks(tmp_path, monkeypatc
             os.write(human_master, b"\r")
             wait_for(b"Baud rate (e.g. 115200): ")
             os.write(human_master, b"115200\r")
-            wait_for(b"Ctrl-] returns to device list")
+            wait_for(b"Ctrl-] returns to device list", start=mark)
+            assert f"{ports[0]} — 115200 baud".encode() in output[mark:]
             assert ports[1].encode() not in output[mark:]
             assert process.poll() is None
             mark = len(output)
