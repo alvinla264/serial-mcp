@@ -1,14 +1,14 @@
 # Generic Serial MCP
 
-A lightweight native Rust/rmcp stdio frontend for a shared Python serial daemon. It does not assume a specific device, shell, login flow, prompt, or command language. The daemon and human terminal remain Python; normal MCP launches run the built executable without starting Python/FastMCP frontend code. Wheel installs use a tiny Python console-script trampoline that immediately `exec`s the native executable.
+A lightweight native Rust/rmcp stdio frontend for a shared Python serial daemon. It does not assume a specific device, shell, login flow, prompt, or command language. The daemon remains Python and the human terminal is a native Rust TUI; normal MCP launches run the built executable without starting Python/FastMCP frontend code. Wheel installs use a tiny Python console-script trampoline that immediately `exec`s the native executable.
 
-The shared application uses a per-user Python daemon and the native Rust MCP
-frontend. AI tools pass an explicit `port` to every device-scoped operation;
+The shared application uses a per-user Python daemon and a native Rust MCP
+frontend; the human terminal is a separate native Rust TUI. AI tools pass an explicit `port` to every device-scoped operation;
 several devices can be controlled independently. `connect(port, baudrate)` opens
 or joins a device and requests control. A busy connection joins read-only, and
 modifying operations require an explicit control-granting `connect`. The shared
-app does not expose raw tio sockets or companion ptys. The native human terminal
-is being migrated separately; see [docs/mcp-frontend.md](docs/mcp-frontend.md).
+app does not expose raw tio sockets or companion ptys. The human terminal uses
+the daemon's human-client surface; see [docs/human-terminal.md](docs/human-terminal.md).
 
 Repo: https://github.com/alvinla264/serial-mcp
 
@@ -24,11 +24,9 @@ Choose a source-based launcher or build a native executable from a local checkou
 
 Notes:
 
-- Source-based `uvx` and pip installations compile the Rust frontend once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed Python console-script trampoline immediately replaces itself with the bundled native executable; it never invokes Cargo or Python's MCP framework during normal launches. Nix installs the binary directly.
+- Source-based `uvx` and pip installations compile the Rust MCP frontend and terminal once while building the wheel; Cargo and a Rust toolchain must be available during installation. The installed Python console-script trampoline immediately replaces itself with the bundled native executable; it never invokes Cargo or Python's MCP framework during normal launches. Nix installs the binary directly.
 - Linux and WSL are the supported Rust frontend targets. FastMCP remains a dependency for the explicit `serial-mcp-legacy` in-process server; it is not the shared-daemon stdio frontend.
-- The Rust launcher speaks daemon IPC v2. The Python parity oracle and native
-  human terminal still speak v1 and cannot be used as shared-daemon clients; the
-  terminal migration is pending in task /15.
+- The Rust MCP launcher and the Rust human terminal both speak daemon IPC v2. The Python parity oracle remains a legacy-only v1 test adapter.
 - `serial-mcp` is the Rust/rmcp stdio frontend of the shared daemon (see
   [Shared daemon](#shared-daemon-protocol-v2)). The previous in-process server is
   `serial-mcp-legacy` (`server.py`). Status and setup: [docs/mcp-frontend.md](docs/mcp-frontend.md).
@@ -148,8 +146,7 @@ Copilot Chat in agent mode and ask it to connect to the serial device.
 
 Then reload/restart the agent so it picks up the server and ask it to connect
 to the serial device by its explicit port path. The shared app does not join
-tio sessions; human access uses the native terminal client when its v2 migration
-lands (task /15).
+tio sessions; humans use `serial-mcp-terminal` for direct console access.
 
 ### Legacy standalone sessions (not shared-daemon mode)
 
@@ -480,10 +477,9 @@ resolve to the same tty identity. Runtime socket discovery uses
 `$SERIAL_MCP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/serial-mcp`, else
 `/tmp/serial-mcp-<uid>`.
 
-The daemon speaks protocol v2. The Rust MCP frontend and native human terminal
-currently speak v1 and fail clearly during negotiation; migration is pending in
-tasks /14 and /15. The explicit in-process legacy server is separate. The v2
-contract and Python wire helpers (`serial_mcp_ipc`) are documented in
+The daemon, Rust MCP frontend and native human terminal speak protocol v2. The
+explicit in-process legacy server is separate. The v2 contract and Python wire
+helpers (`serial_mcp_ipc`) are documented in
 [docs/daemon-ipc.md](docs/daemon-ipc.md).
 
 - A registered client alone holds no device open. Membership joins keep a device
@@ -502,11 +498,7 @@ stdlib-only.
 
 ## Human terminal
 
-`serial-mcp-terminal` is a native multi-device TUI for humans. It lists available
-ports, displays the registered MCP-client count and per-device status, and joins a
-selected device without acquiring an AI lease. Ctrl-] leaves the current pane;
-Ctrl-Q quits the app. Install and usage details, lifecycle semantics and accepted
-concurrent-input/baud-interference risks are in
+`serial-mcp-terminal` is an install-time-built Rust multi-device TUI for humans. It shows available and open devices in a left sidebar, keeps MCP-only count/status visible, and renders device ANSI output inside a VT100 screen buffer. Switching leaves the prior membership; cached screens are retained locally with an observation-gap marker. The TUI never acquires AI control. Use Ctrl-] or Esc to leave, Ctrl-B for confirmed shared baud changes, and `q` or Ctrl-Q from the sidebar to quit. Install and usage details, lifecycle semantics and accepted concurrent-input risks are in
 [docs/human-terminal.md](docs/human-terminal.md).
 
 ## Legacy engine session surfaces

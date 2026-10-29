@@ -14,9 +14,7 @@ installed or supported shared-app frontend. `server.py` / `serial-mcp-legacy`
 is a separate in-process adapter, not a client of the shared daemon. Do not run
 it concurrently with another process that owns the same serial device.
 
-The native human terminal is being migrated separately in task /15. Until that
-migration lands, its v1 client is incompatible with the v2 daemon. See
-[human-terminal.md](human-terminal.md) for its current status.
+The human terminal is a separate install-time-built Rust executable and remains a human IPC client of the shared v2 daemon. See [human-terminal.md](human-terminal.md) for its controls and ownership rules.
 
 ## MCP tool behavior
 
@@ -49,7 +47,7 @@ Build the native frontend once during installation or from a checkout:
 cargo build --release --locked --manifest-path rust-client/Cargo.toml
 ```
 
-The local executable is `rust-client/target/release/serial-mcp-rust-client`.
+The local executables are `rust-client/target/release/serial-mcp-rust-client` and `rust-client/target/release/serial-mcp-terminal`.
 The supported launch paths include `uvx --from <source> serial-mcp` and the Nix
 entrypoint. Source builds require Cargo and a Rust toolchain; ordinary native
 launches do not. The Python packaging trampoline only `exec`s the built native

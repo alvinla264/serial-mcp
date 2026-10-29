@@ -390,6 +390,8 @@ class Connection:
                 return self.send_result(rid, {"subscribed": False, "device_id": device.device_id})
         if op in ("join", "leave"):
             return self._op_membership(rid, frame, op)
+        if op == "human_set_baudrate":
+            return self._op_human_set_baudrate(rid, frame)
         if op == "ports":
             if self.role != "human":
                 return self.send_error(rid, "forbidden_role", "port enumeration is a human operation")
@@ -480,6 +482,39 @@ class Connection:
         return self.send_result(rid, {"joined": True, "device_id": device.device_id,
                                       "port": port, "baudrate": device.baudrate,
                                       "control": "available" if device.controller is None else "held"})
+
+    def _op_human_set_baudrate(self, rid, frame: dict) -> None:
+        if self.role != "human":
+            return self.send_error(rid, "forbidden_role", "human_set_baudrate is human-only")
+        if set(frame) - {"v", "id", "op", "port", "baudrate"}:
+            return self.send_error(rid, "bad_request", "unexpected human_set_baudrate field")
+        port, baud = frame.get("port"), frame.get("baudrate")
+        if not isinstance(port, str) or isinstance(baud, bool) or not isinstance(baud, int) or not 1 <= baud <= 4_000_000:
+            return self.send_error(rid, "bad_args", "port and baudrate from 1 through 4000000 are required")
+        device = self.daemon._device_for_call(self, port)
+        if device is None:
+            return self.send_error(rid, "not_member", "join the device before changing its baudrate")
+        with self.daemon._drained:
+            if not device.online or device.closing or self not in device.members:
+                return self.send_error(rid, "not_connected", "device is not connected")
+            device.active += 1
+            device.in_flight += 1
+        try:
+            with device.settings_lock:
+                text = device.state.set_baudrate(baud)
+                actual = getattr(device.state.transport, "baudrate", device.baudrate)
+                if isinstance(actual, int) and actual > 0:
+                    self.daemon._publish_settings(device, actual)
+                if text.startswith("Error:"):
+                    return self.send_error(rid, "baudrate_rejected", text, baudrate=device.baudrate)
+                result = {"result": text, "device_id": device.device_id,
+                          "port": port, "baudrate": device.baudrate,
+                          "generation": device.generation}
+            return self.send_result(rid, result)
+        except Exception as exc:
+            return self.send_error(rid, "baudrate_rejected", f"baudrate change failed: {exc}", baudrate=device.baudrate)
+        finally:
+            self.daemon._end_device_operation(device, self)
 
     def _op_input(self, rid, frame: dict) -> None:
         if self.role != "human":

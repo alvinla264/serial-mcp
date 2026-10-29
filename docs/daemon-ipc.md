@@ -2,9 +2,7 @@
 
 Status: **frozen** for protocol version 2. This is a breaking replacement for
 v1; peers must reject any other version with `unsupported_version` and close the
-connection. V1 single-device semantics are never inferred or adapted. The Rust
-MCP frontend negotiates v2. The native human terminal migration remains pending
-in task /15; its current v1 client is incompatible with this daemon.
+connection. V1 single-device semantics are never inferred or adapted. The Rust MCP frontend and native Rust human terminal negotiate v2.
 
 The daemon is per-user and owns zero or more physical serial connections. Its
 stdlib-only local UNIX IPC is shared by the MCP and human clients. The daemon
@@ -94,7 +92,11 @@ First request is `hello`:
   {port,baudrate?}` and `leave {port}` are human-role internal operations. Join
   opens if absent (baud required then),
   otherwise joins at actual baud; neither grants AI control. Leave removes only
-  that human membership.
+  that human membership. `human_set_baudrate {port,baudrate}` is human-role-only,
+  requires membership, validates 1–4,000,000, and changes the shared transport
+  immediately without acquiring or renewing AI control. It broadcasts the normal
+  `settings` event and may disrupt concurrent AI work; clients must confirm that
+  shared impact before sending it.
 - `ports {}` is human-role-only and returns `{result:<engine port listing>}` for
   selection; it does not open a port. `bye {}` responds then closes.
 
@@ -181,6 +183,6 @@ This contract intentionally breaks v1. The Rust shared-app MCP frontend now
 negotiates v2 and requires explicit `port` arguments for device-scoped tools. Its
 catalog exposes `set_baudrate` and removes `attach`, `tio_info`, and the three
 public lease tools. It never creates a raw tio socket or companion pty. The
-native human terminal migration remains assigned to task /15; until it lands, its
-v1 client must reject this daemon clearly. The Python parity oracle is likewise
+native human terminal uses the human membership/input surface, not MCP control.
+The Python parity oracle is likewise
 a legacy-only v1 adapter outside the supported shared-app surface.

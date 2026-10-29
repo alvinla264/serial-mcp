@@ -1,4 +1,4 @@
-"""PEP 517 wrapper that builds and installs the native Linux MCP executable."""
+"""PEP 517 wrapper that builds and installs the native Linux executables."""
 from __future__ import annotations
 
 import base64
@@ -19,6 +19,7 @@ from hatchling.build import prepare_metadata_for_build_wheel as _prepare_metadat
 
 ROOT = Path(__file__).resolve().parent
 BINARY = ROOT / "build" / "rust-target" / "release" / "serial-mcp-rust-client"
+TERMINAL_BINARY = ROOT / "build" / "rust-target" / "release" / "serial-mcp-terminal"
 
 
 def _build_binary() -> None:
@@ -29,8 +30,8 @@ def _build_binary() -> None:
         cwd=ROOT,
         check=True,
     )
-    if not BINARY.is_file():
-        raise RuntimeError(f"cargo succeeded but executable is missing: {BINARY}")
+    if not BINARY.is_file() or not TERMINAL_BINARY.is_file():
+        raise RuntimeError("cargo succeeded but a required executable is missing")
 
 
 def _record_line(path: str, data: bytes) -> tuple[str, str, str]:
@@ -46,6 +47,8 @@ def _inject_executable(wheel_path: Path) -> str:
     # does not reliably relocate this platform-tagged wheel's `.data` payload.
     binary_name = "serial-mcp-rust-client"
     binary = BINARY.read_bytes()
+    terminal_name = "serial-mcp-terminal"
+    terminal_binary = TERMINAL_BINARY.read_bytes()
     rows: list[tuple[str, str, str]] = []
     wheel_metadata = next(name for name, _ in entries if name.filename.endswith(".dist-info/WHEEL"))
     with tempfile.NamedTemporaryFile(dir=wheel_path.parent, suffix=".whl", delete=False) as temp:
@@ -68,6 +71,12 @@ def _inject_executable(wheel_path: Path) -> str:
             binary_info.compress_type = zipfile.ZIP_STORED
             target.writestr(binary_info, binary)
             rows.append(_record_line(binary_name, binary))
+            terminal_info = zipfile.ZipInfo(terminal_name)
+            terminal_info.create_system = 3
+            terminal_info.external_attr = (0o100755 << 16)
+            terminal_info.compress_type = zipfile.ZIP_STORED
+            target.writestr(terminal_info, terminal_binary)
+            rows.append(_record_line(terminal_name, terminal_binary))
             record = ("\n".join(",".join(row) for row in rows) + f"\n{record_name.filename},,\n").encode()
             target.writestr(record_name, record)
         platform_tag = sysconfig.get_platform().replace("-", "_").replace(".", "_")

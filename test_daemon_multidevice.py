@@ -261,6 +261,27 @@ def test_v1_python_mcp_frontend_fails_clearly_at_negotiation(devices_runtime):
     assert b"speaks protocol 2" in process.stderr and b"frontend speaks 1" in process.stderr
 
 
+def test_human_can_change_baud_without_acquiring_ai_control(devices_runtime):
+    master, port, slave = open_pty()
+    os.close(slave)
+    ai=connect_client(devices_runtime)
+    human=connect_client(devices_runtime)
+    try:
+        ai.hello("mcp","synthetic-controller")
+        human.hello("human","terminal")
+        connected=ai.call("connect",{"port":port,"baudrate":115200})
+        assert connected["control"]=="granted"
+        human.join(port)
+        changed=human.request("human_set_baudrate",port=port,baudrate=19200)
+        assert changed["baudrate"]==19200
+        assert next_event_of(ai,"settings")["baudrate"]==19200
+        assert human.status()["devices"][0]["control"]=="held"
+        with pytest.raises(ipc.DaemonError):
+            human.request("human_set_baudrate",port=port,baudrate=0)
+    finally:
+        human.close(); ai.close(); os.close(master)
+
+
 def test_human_join_and_input_need_no_ai_control(devices_runtime):
     master, port, slave = open_pty()
     os.close(slave)
@@ -272,6 +293,9 @@ def test_human_join_and_input_need_no_ai_control(devices_runtime):
         result = human.human_input(b"x", port)
         assert result["written"] == 1
         assert os.read(master, 1) == b"x"
+        changed=human.request("human_set_baudrate",port=port,baudrate=19200)
+        assert changed["baudrate"]==19200
+        assert human.status()["devices"][0]["control"]=="available"
         human.leave(port)
         assert human.status()["devices"] == []
     finally:

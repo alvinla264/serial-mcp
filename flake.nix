@@ -42,6 +42,10 @@
             cp server.py serial_mcp_engine.py serial_mcp_ipc.py serial_mcp_daemon.py serial_mcp_terminal.py $out/share/serial-mcp/
             # The compiled rmcp frontend is ready-built at installation; runtime launch never invokes cargo.
             cp ${rustClient}/bin/serial-mcp-rust-client $out/bin/serial-mcp
+            cp ${rustClient}/bin/serial-mcp-terminal $out/bin/serial-mcp-terminal
+            wrapProgram $out/bin/serial-mcp-terminal \
+              --prefix PATH : $out/bin:${pythonEnv}/bin \
+              --prefix PYTHONPATH : $out/share/serial-mcp
             chmod +x $out/bin/serial-mcp
             # serial-mcp-legacy is the previous in-process server (one device per MCP process).
             cp server.py $out/bin/serial-mcp-legacy
@@ -59,9 +63,6 @@
               --add-flags "-m serial_mcp_daemon" \
               --prefix PYTHONPATH : $out/share/serial-mcp
 
-            makeWrapper ${pythonEnv}/bin/python3 $out/bin/serial-mcp-terminal \
-              --add-flags "-m serial_mcp_terminal" \
-              --prefix PYTHONPATH : $out/share/serial-mcp
           '';
         };
 
