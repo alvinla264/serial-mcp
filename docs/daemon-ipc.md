@@ -3,8 +3,8 @@
 Status: **frozen** for protocol version 2. This is a breaking replacement for
 v1; peers must reject any other version with `unsupported_version` and close the
 connection. V1 single-device semantics are never inferred or adapted. The Rust
-MCP frontend and native human terminal must negotiate v2 before use; migrations
-are pending in tasks /14 and /15.
+MCP frontend negotiates v2. The native human terminal migration remains pending
+in task /15; its current v1 client is incompatible with this daemon.
 
 The daemon is per-user and owns zero or more physical serial connections. Its
 stdlib-only local UNIX IPC is shared by the MCP and human clients. The daemon
@@ -23,7 +23,8 @@ ignored. A well-formed unsupported-version frame receives `unsupported_version`
 and closes. Errors never contain private controller identity.
 
 A client becomes registered only after `hello`; idle registered MCP and human
-clients count in `status.clients`. EOF/crash unregisters immediately. Zero
+clients count in `status.clients`, while `status.mcp_clients` counts only MCP
+clients. EOF/crash unregisters immediately. Zero
 registered clients starts the 30-second shutdown grace; a new hello cancels it.
 The daemon closes devices only after memberships leave and safe operations settle.
 A disconnected client leaves every device. Registration alone holds no device.
@@ -44,17 +45,23 @@ events/cursors within the daemon lifetime, not as a global identity.
 First request is `hello`:
 
 - `hello {role:"mcp"|"human", name:string<=64, pid?:int, client_version?:string}`
-  → `{protocol:2,daemon_version,client_id,role,clients,devices:[snapshot...]}`.
-  `client_id` is private to that caller's handshake; never disclose other client
-  names, IDs, or membership mappings.
-- `status {}` → `{protocol,daemon_version,clients,grace,shutting_down,devices}`.
+  → `{protocol:2,daemon_version,client_id,role,clients,mcp_clients,devices:[snapshot...]}`.
+  `clients` is the all-role registered-client total; `mcp_clients` counts only
+  registered MCP clients, including idle MCP clients and excluding human
+  terminals. These are totals only. `client_id` is private to that caller's
+  handshake; never disclose other client names, IDs, or membership mappings.
+  `mcp_clients` is an additive v2 field; a human terminal that requires it must
+  fail clearly against an older v2 daemon rather than mislabel the total.
+- `status {}` → `{protocol,daemon_version,clients,mcp_clients,grace,shutting_down,devices}`.
+  `clients` counts all registered MCP and human clients; `mcp_clients` counts
+  registered MCP clients only, including idle clients.
   Each device snapshot is `{device_id,port,state:"connected"|"disconnected"|"closing",
   baudrate,control:"available"|"held",members:n,generation}`. A vanished tty is
   reported as `disconnected`; a later `connect` on the same selector reopens it
   before returning success. No controller identity is exposed. `clients` counts
-  every registered client, including clients with no memberships; `members` is
-  the number of AI/human participants
-  joined to that device.
+  all registered clients, including clients with no memberships; `mcp_clients`
+  is the MCP-only count. `members` is the number of AI/human participants joined
+  to that device.
 - `call {tool,args}` invokes an approved engine tool. Device-affecting tools
   require `args.port`; `connect` also requires `baudrate`. `connect(port,baudrate)`
   resolves/opens or joins the physical device and requests control atomically.
@@ -95,9 +102,14 @@ AI tools include `send_command`, `read_output`, `clear_output`,
 `set_prompt_pattern`, `login`, `enter_bootloader`, `upload_file`,
 `download_file`, `view_io`, `set_baudrate`, and `file_transfer_capabilities`.
 `connect`, `disconnect`, and `set_baudrate` have daemon-owned semantics above.
-Legacy attach/tio/session-socket controls, `tio_info`, list/profile/credential
-utilities and public lease acquire/release/status are not exposed in the shared
-application. Tools not defined here return `unknown_tool`.
+Legacy attach/tio/session-socket controls, `tio_info`, and public lease
+acquire/release/status are not exposed in the shared application. The MCP role
+exposes the 16-tool catalog in `rust-client/tools.json`. Device-scoped tools
+require explicit `port`; `file_transfer_capabilities`, `list_serial_ports`, and
+`list_boot_profiles` are global and require no device membership or lease.
+`set_boot_credentials` is also global, MCP-only, and writes only to the protected
+user credential store (mode 0600); secrets are never returned or logged. Global
+tools reject unexpected arguments. Tools not defined here return `unknown_tool`.
 
 ## Permissions, lease, operation concurrency
 
@@ -133,8 +145,9 @@ settings), and `device` with `state` equal to `open` (physical tty opened or
 reopened), `joined` / `left` (membership changed), `disconnected` (physical tty
 vanished), or `closed` (physical tty close completed). Device events carry
 snapshot-safe `device_id`, `port`, `baudrate`, and `generation` fields. `output`,
-`output_gap`, `control_lost`, `clients` (count only), `event_gap` (local client
-event queue overflow), and `shutdown` are also emitted. These names describe the
+`output_gap`, `control_lost`, `clients` (all-role `clients` and MCP-only
+`mcp_clients` counts only), `event_gap` (local client event queue overflow), and
+`shutdown` are also emitted. These names describe the
 wire states; `connected` is a status snapshot value, not a device-event state.
 Events are not authorization. MCP clients retain
 settings notices in a bounded per-device queue and prepend notices to the next
@@ -164,6 +177,10 @@ reconnect, inspect status/output, and explicitly call `connect(port,baudrate)`
 to regain control. On socket EOF/crash daemon membership cleanup follows the
 same safe-settlement/last-member-close rules as `disconnect`.
 
-This contract intentionally breaks v1. Existing Rust and Python frontends need
-migration and must fail clearly at version negotiation meanwhile; combined
-frontend integration and Cargo checks belong to the dependent migration tasks.
+This contract intentionally breaks v1. The Rust shared-app MCP frontend now
+negotiates v2 and requires explicit `port` arguments for device-scoped tools. Its
+catalog exposes `set_baudrate` and removes `attach`, `tio_info`, and the three
+public lease tools. It never creates a raw tio socket or companion pty. The
+native human terminal migration remains assigned to task /15; until it lands, its
+v1 client must reject this daemon clearly. The Python parity oracle is likewise
+a legacy-only v1 adapter outside the supported shared-app surface.

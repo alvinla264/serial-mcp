@@ -58,8 +58,8 @@ MAX_PENDING_SETTINGS = 32
 MAX_CONTROL_QUEUE_FRAMES = 64
 ROLES = ("mcp", "human")
 
-# Tool name -> (SerialState method, gated). "file_transfer_capabilities" is served
-# from its module constant and is handled separately.
+# Tool name -> (SerialState method, gated). Global tools are dispatched explicitly
+# below so device membership and control checks cannot leak across tool scope.
 TOOL_TABLE: dict[str, tuple[str | None, bool]] = {
     "connect": ("connect", True), "disconnect": ("disconnect", True),
     "set_baudrate": ("set_baudrate", True), "send_command": ("send_command", True),
@@ -68,6 +68,9 @@ TOOL_TABLE: dict[str, tuple[str | None, bool]] = {
     "enter_bootloader": ("enter_bootloader", True), "upload_file": ("upload_file", True),
     "download_file": ("download_file", True), "view_io": ("view_io", False),
     "file_transfer_capabilities": (None, False),
+    "list_serial_ports": ("list_serial_ports", False),
+    "list_boot_profiles": ("list_boot_profiles", False),
+    "set_boot_credentials": ("set_boot_credentials", False),
 }
 @dataclass
 class Device:
@@ -760,11 +763,13 @@ class DaemonServer:
                 return None
             self._clients.add(conn)
             self._grace_started = None
+            count = len(self._clients)
+            mcp_count = sum(client.role == "mcp" for client in self._clients)
             result = {"protocol": PROTOCOL_VERSION, "daemon_version": DAEMON_VERSION,
                       "client_id": conn.cid, "role": conn.role,
-                      "devices": self._device_snapshots_locked(), "clients": len(self._clients)}
-            count = len(self._clients)
-        self._broadcast_count(count)
+                      "devices": self._device_snapshots_locked(), "clients": count,
+                      "mcp_clients": mcp_count}
+        self._broadcast_count(count, mcp_count)
         return result
 
     def unregister(self, conn: Connection) -> None:
@@ -777,13 +782,14 @@ class DaemonServer:
             if not self._clients and not self._shutting_down:
                 self._grace_started = self.clock()
             count = len(self._clients)
+            mcp_count = sum(client.role == "mcp" for client in self._clients)
             self._drained.notify_all()
         deadline = (self._shutdown_deadline if self._shutting_down
                     and self._shutdown_deadline is not None
                     else time.monotonic() + DRAIN_TIMEOUT_SECONDS)
         for device in memberships:
             self._leave_device(conn, device, deadline=deadline)
-        self._broadcast_count(count)
+        self._broadcast_count(count, mcp_count)
 
     def status(self, viewer: Connection | None = None) -> dict:
         with self._lock:
@@ -795,13 +801,14 @@ class DaemonServer:
                 "daemon_version": DAEMON_VERSION,
                 "protocol": PROTOCOL_VERSION,
                 "clients": len(self._clients),
+                "mcp_clients": sum(client.role == "mcp" for client in self._clients),
                 "grace": {"active": grace_remaining is not None, "remaining": grace_remaining},
                 "shutting_down": self._shutting_down,
                 "devices": self._device_snapshots_locked(),
             }
 
-    def _broadcast_count(self, count: int) -> None:
-        frame = {"event": "clients", "clients": count}
+    def _broadcast_count(self, count: int, mcp_count: int) -> None:
+        frame = {"event": "clients", "clients": count, "mcp_clients": mcp_count}
         with self._lock:
             clients = list(self._clients)
         for conn in clients:
@@ -1030,7 +1037,8 @@ class DaemonServer:
                     self._devices[old_identity] = device
                     device.identity = old_identity
                     self._drained.notify_all()
-                return None, {"code": "internal", "message": f"could not reopen device: {exc}"}
+                message = str(exc).replace("use its tio socket with attach(), or ask its owner to close it", "ask its owner to close it before connecting")
+                return None, {"code": "internal", "message": f"could not reopen device: {message}"}
             with self._drained:
                 device.port = port
                 device.node_fingerprint = actual_fingerprint
@@ -1088,7 +1096,8 @@ class DaemonServer:
                     if self._devices.get(identity) is device:
                         del self._devices[identity]
                     self._drained.notify_all()
-            return None, {"code": "internal", "message": f"could not open device: {exc}"}
+            message = str(exc).replace("use its tio socket with attach(), or ask its owner to close it", "ask its owner to close it before connecting")
+            return None, {"code": "internal", "message": f"could not open device: {message}"}
         with self._drained:
             if conn.closed or self._shutting_down:
                 device.closing = True
@@ -1261,13 +1270,44 @@ class DaemonServer:
         if conn.role != "mcp":
             conn.send_error(rid, "forbidden_role", "AI device tools require the mcp role")
             return
-        if tool not in {"connect", "disconnect", "set_baudrate", "send_command", "read_output",
-                        "clear_output", "set_prompt_pattern", "login", "enter_bootloader",
-                        "upload_file", "download_file", "view_io", "file_transfer_capabilities"}:
+        if tool not in TOOL_TABLE:
             conn.send_error(rid, "unknown_tool", f"unknown tool {tool!r}")
             return
         if tool == "file_transfer_capabilities":
+            if args:
+                conn.send_error(rid, "bad_args", "file_transfer_capabilities accepts no arguments")
+                return
             conn.send_result(rid, {"result": FILE_TRANSFER_CAPABILITIES})
+            return
+        if tool in {"list_serial_ports", "list_boot_profiles"}:
+            if args:
+                conn.send_error(rid, "bad_args", f"{tool} accepts no arguments")
+                return
+            try:
+                result = getattr(self.state, TOOL_TABLE[tool][0])()
+            except Exception:
+                self.log("ERR", f"global tool {tool} failed")
+                conn.send_error(rid, "internal", f"{tool} failed unexpectedly")
+                return
+            conn.send_result(rid, {"result": result})
+            return
+        if tool == "set_boot_credentials":
+            if set(args) != {"profile_key", "username", "password"} or not all(
+                isinstance(args[k], str) and args[k] and len(args[k]) <= 4096
+                for k in ("profile_key", "username", "password")
+            ):
+                conn.send_error(rid, "bad_args", "set_boot_credentials requires non-empty profile_key, username, and password (each at most 4096 characters)")
+                return
+            try:
+                result = self.state.set_boot_credentials(args["profile_key"], args["username"], args["password"])
+            except Exception:
+                self.log("ERR", "global tool set_boot_credentials failed")
+                conn.send_error(rid, "internal", "set_boot_credentials failed unexpectedly")
+                return
+            if isinstance(result, str) and result.startswith("Error"):
+                conn.send_error(rid, "credential_store_error", "credential storage failed")
+            else:
+                conn.send_result(rid, {"result": f"Credentials stored locally for {args['profile_key']}."})
             return
         port = args.get("port")
         if not isinstance(port, str) or not port:

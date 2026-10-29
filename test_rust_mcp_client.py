@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,12 +21,15 @@ import serial_mcp_client as python_oracle
 import server as legacy
 from tools.export_tool_catalog import _fastmcp2_metadata
 from test_mcp_client import (
-    ScriptedDaemon, _daemon_pids_for, _hello_result, _reply,
-    daemon, echo_device, real_runtime,
+    ScriptedDaemon, _daemon_pids_for, _hello_result, _pty_device, _reply, real_runtime,
 )
 
 ROOT = Path(__file__).resolve().parent
 BINARY = Path(os.environ.get("SERIAL_MCP_RUST_CLIENT", ROOT / "build/rust-target/release/serial-mcp-rust-client"))
+
+
+def text_of(result):
+    return "".join(getattr(item, "text", "") for item in result.content)
 
 
 async def _mcp_metadata(mcp):
@@ -37,9 +41,27 @@ async def _mcp_metadata(mcp):
     return {tool.name: (tool.description, tool.parameters) for tool in tools}
 
 
-def test_rust_tool_catalog_matches_the_python_oracle():
+def test_rust_catalog_matches_the_shared_daemon_v2_surface():
     subprocess.run([sys.executable, str(ROOT / "tools/export_tool_catalog.py"), "--check"],
                    cwd=ROOT, check=True)
+    catalog = json.loads((ROOT / "rust-client/tools.json").read_text())
+    tools = {item["name"]: item for item in catalog}
+    assert len(catalog) == 16
+    assert {"attach", "tio_info", "lease_acquire", "lease_release", "lease_status"}.isdisjoint(tools)
+    assert "set_baudrate" in tools
+    device_tools = {
+        "connect", "disconnect", "send_command", "read_output", "clear_output",
+        "set_prompt_pattern", "login", "enter_bootloader", "upload_file",
+        "download_file", "view_io", "set_baudrate",
+    }
+    for name in device_tools:
+        schema = tools[name]["inputSchema"]
+        assert "port" in schema["required"], name
+        assert schema["properties"]["port"]["type"] == "string", name
+    assert set(tools["connect"]["inputSchema"]["properties"]) == {"port", "baudrate"}
+    assert set(tools["set_baudrate"]["inputSchema"]["required"]) == {"port", "baudrate"}
+    for name in {"file_transfer_capabilities", "list_boot_profiles", "set_boot_credentials", "list_serial_ports"}:
+        assert "port" not in tools[name]["inputSchema"].get("required", []), name
 
 
 def transport(runtime: Path, name: str) -> StdioTransport:
@@ -48,33 +70,178 @@ def transport(runtime: Path, name: str) -> StdioTransport:
              "PYTHONPATH": str(ROOT)}, cwd=str(ROOT), keep_alive=False)
 
 
-def test_rust_v1_tool_catalog_and_v2_rejection(daemon, real_runtime):
+def test_rust_global_tools_dispatch_through_real_daemon(real_runtime, tmp_path, monkeypatch):
     if not BINARY.is_file():
-        pytest.skip("build rust-client first; tests always exercise the built executable, never cargo at launch")
+        pytest.skip("build rust-client first")
+    home = tmp_path / "home"
+    config = home / ".config" / "serial-mcp"
+    config.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
 
     async def scenario():
-        async with Client(transport(real_runtime, "rust-integration")) as client:
-            native = {tool.name: tool for tool in await client.list_tools()}
-            oracle = await _mcp_metadata(python_oracle.mcp)
-            legacy_tools = await _mcp_metadata(legacy.mcp)
-            assert set(native) == set(oracle)
-            assert set(native) - {"lease_acquire", "lease_release", "lease_status"} == set(legacy_tools)
-            for name, tool in native.items():
-                assert tool.description == (oracle[name][0] or "")
-                native_schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", {})
-                assert native_schema == oracle[name][1]
-                if name in legacy_tools:
-                    assert tool.description == (legacy_tools[name][0] or "")
-                    assert native_schema == legacy_tools[name][1]
-
-            refused = await client.call_tool("file_transfer_capabilities", {}, raise_on_error=False)
-            message = "".join(item.text for item in refused.content)
-            assert refused.is_error
-            assert "daemon protocol mismatch" in message
-            assert "frontend speaks protocol 1" in message
-            assert "peer speaks 2" in message
+        async with Client(transport(real_runtime, "rust-global")) as client:
+            catalog = json.loads((ROOT / "rust-client/tools.json").read_text())
+            assert len(await client.list_tools()) == 16
+            for tool in catalog:
+                name = tool["name"]
+                required = tool["inputSchema"].get("required", [])
+                args = {}
+                for key in required:
+                    if key == "port":
+                        args[key] = "/dev/serial-mcp-missing"
+                    elif key == "baudrate":
+                        args[key] = 115200
+                    else:
+                        args[key] = "synthetic-value"
+                result = await client.call_tool(name, args, raise_on_error=False)
+                assert "unknown_tool" not in text_of(result), (name, text_of(result))
+            profiles = await client.call_tool("list_boot_profiles", {})
+            assert not profiles.is_error, text_of(profiles)
+            assert "unknown_tool" not in text_of(profiles)
+            ports = await client.call_tool("list_serial_ports", {})
+            assert not ports.is_error and "unknown_tool" not in text_of(ports)
+            stored = await client.call_tool("set_boot_credentials", {
+                "profile_key": "synthetic-profile", "username": "synthetic-user",
+                "password": "synthetic-secret"})
+            assert not stored.is_error and "synthetic-secret" not in text_of(stored)
+            path = config / "credentials.json"
+            assert path.exists() and path.stat().st_mode & 0o777 == 0o600
+            assert json.loads(path.read_text())["synthetic-profile"]["password"] == "synthetic-secret"
+            bad = await client.call_tool("set_boot_credentials", {"password": "x"}, raise_on_error=False)
+            assert bad.is_error and "unknown_tool" not in text_of(bad)
+            assert len(_daemon_pids_for(real_runtime)) == 1
 
     asyncio.run(scenario())
+
+
+def test_rust_v2_routes_tools_to_multiple_devices_with_independent_control(real_runtime, tmp_path):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first; tests always exercise the built executable, never cargo at launch")
+    def subprocess_echo(master, stop):
+        while not stop.is_set():
+            try:
+                readable, _, _ = select.select([master], [], [], 0.05)
+                if readable:
+                    os.write(master, os.read(master, 1024).upper())
+            except OSError as exc:
+                if exc.errno != 5:
+                    raise
+                time.sleep(0.01)
+
+    first = _pty_device(subprocess_echo)
+    second = _pty_device(subprocess_echo)
+    # Keep only each master as the fake device; the setup slave would look like
+    # an unrelated holder to the real daemon's ownership safety scan.
+    os.close(first[1])
+    os.close(second[1])
+    alias = tmp_path / "serial-alias"
+    alias.symlink_to(first[2])
+
+    async def scenario():
+        async with Client(transport(real_runtime, "rust-multi-one")) as owner:
+            async with Client(transport(real_runtime, "rust-multi-two")) as observer:
+                names = {tool.name for tool in await owner.list_tools()}
+                assert len(names) == 16
+                assert {"attach", "tio_info", "lease_acquire", "lease_release", "lease_status"}.isdisjoint(names)
+                assert "set_baudrate" in names
+                invalid = await owner.call_tool("connect", {"port": "/dev/serial-mcp-missing", "baudrate": 115200}, raise_on_error=False)
+                assert invalid.is_error and "invalid_port" in text_of(invalid)
+                connected = await owner.call_tool("connect", {"port": first[2], "baudrate": 115200})
+                assert not connected.is_error, text_of(connected)
+                bad_baud = await owner.call_tool("set_baudrate", {"port": first[2], "baudrate": 0}, raise_on_error=False)
+                assert bad_baud.is_error and "baudrate_rejected" in text_of(bad_baud)
+                assert "Actual baudrate remains 115200" in text_of(bad_baud)
+                busy = await observer.call_tool("connect", {"port": str(alias), "baudrate": 57600})
+                assert not busy.is_error, text_of(busy)
+                assert "Control not granted" in text_of(busy)
+                assert "actual baudrate 115200" in text_of(busy)
+                assert "Requested baudrate 57600 differs" in text_of(busy)
+                other = await owner.call_tool("connect", {"port": second[2], "baudrate": 38400})
+                assert not other.is_error, text_of(other)
+                r1 = await owner.call_tool("send_command", {"port": first[2], "text": "alpha"})
+                r2 = await owner.call_tool("send_command", {"port": second[2], "text": "beta"})
+                assert not r1.is_error and "ALPHA" in text_of(r1)
+                assert not r2.is_error and "BETA" in text_of(r2)
+                observed_output = await observer.call_tool("read_output", {"port": str(alias), "timeout": 0})
+                owner_output = await owner.call_tool("read_output", {"port": first[2], "timeout": 0})
+                assert "ALPHA" in text_of(observed_output) and "ALPHA" in text_of(owner_output)
+                changed = await owner.call_tool("set_baudrate", {"port": first[2], "baudrate": 19200})
+                assert not changed.is_error, text_of(changed)
+                assert "actual baudrate is 19200" in text_of(changed)
+                notice = await observer.call_tool("read_output", {"port": str(alias), "timeout": 0})
+                assert not notice.is_error
+                assert "settings changed: baudrate is now 19200" in text_of(notice)
+                left = await owner.call_tool("disconnect", {"port": first[2]})
+                assert not left.is_error
+                refused = await observer.call_tool("send_command", {"port": str(alias), "text": "must-not-acquire"}, raise_on_error=False)
+                assert refused.is_error and "control_required" in text_of(refused)
+                reacquired = await observer.call_tool("connect", {"port": str(alias), "baudrate": 57600})
+                assert not reacquired.is_error and "Control granted" in text_of(reacquired)
+                assert "remains at 19200" in text_of(reacquired)
+                remains = await owner.call_tool("send_command", {"port": second[2], "text": "still-here"})
+                assert not remains.is_error and "STILL-HERE" in text_of(remains)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        for device in (first, second):
+            device[3].set()
+            device[4].join(timeout=2)
+            os.close(device[0])
+
+
+def test_rust_set_baudrate_warns_when_an_inflight_call_spans_the_change(real_runtime):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_echo(master, stop):
+        import select
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master not in readable:
+                continue
+            try:
+                payload = os.read(master, 1024)
+            except OSError as exc:
+                if exc.errno == 5:  # PTY master reports EIO until the daemon opens its slave.
+                    stop.wait(0.02)
+                    continue
+                raise
+            started.set()
+            if not release.wait(4):
+                return
+            os.write(master, payload.upper())
+            return
+
+    device = _pty_device(delayed_echo)
+    os.close(device[1])  # Only the daemon subprocess may hold the slave.
+
+    async def scenario():
+        async with Client(transport(real_runtime, "rust-inflight-baud")) as client:
+            joined = await client.call_tool("connect", {"port": device[2], "baudrate": 115200})
+            assert not joined.is_error, text_of(joined)
+            assert len(_daemon_pids_for(real_runtime)) == 1
+            inflight = asyncio.create_task(client.call_tool(
+                "send_command", {"port": device[2], "text": "held", "timeout": 4}
+            ))
+            assert await asyncio.to_thread(started.wait, 3), "device did not receive command"
+            changed = await client.call_tool("set_baudrate", {"port": device[2], "baudrate": 19200})
+            assert not changed.is_error, text_of(changed)
+            release.set()
+            result = await inflight
+            assert not result.is_error and "HELD" in text_of(result)
+            assert "settings changed during this operation; output/outcome may be affected" in text_of(result)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        device[3].set()
+        device[4].join(timeout=2)
+        os.close(device[0])
 
 
 def test_rust_local_source_build_starts_daemon_outside_repository_cwd(tmp_path):
@@ -123,13 +290,10 @@ def test_rust_local_source_build_starts_daemon_outside_repository_cwd(tmp_path):
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         send({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "lease_status", "arguments": {}},
+            "params": {"name": "file_transfer_capabilities", "arguments": {}},
         })
         reply = receive(2)
-        assert reply.get("result", {}).get("isError") is True, reply
-        message = "".join(block.get("text", "") for block in reply["result"]["content"])
-        assert "daemon protocol mismatch" in message
-        assert "frontend speaks protocol 1" in message
+        assert reply.get("result", {}).get("isError") is False, reply
         assert len(_daemon_pids_for(runtime)) == 1
     finally:
         if frontend.poll() is None:
@@ -145,6 +309,82 @@ def test_rust_local_source_build_starts_daemon_outside_repository_cwd(tmp_path):
         frontend.stderr.close()
 
 
+def test_rust_process_crash_releases_all_device_memberships(real_runtime):
+    if not BINARY.is_file():
+        pytest.skip("build rust-client first")
+    def echo_until_daemon_opens(master, stop):
+        while not stop.is_set():
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if master not in readable:
+                continue
+            try:
+                payload = os.read(master, 1024)
+            except OSError as exc:
+                if exc.errno == 5:
+                    stop.wait(0.02)
+                    continue
+                raise
+            os.write(master, payload.upper())
+
+    echo_device = _pty_device(echo_until_daemon_opens)
+    os.close(echo_device[1])  # Keep pytest from impersonating the device owner.
+    env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(real_runtime),
+               SERIAL_MCP_CLIENT_NAME="rust-crash-owner", PYTHONPATH=str(ROOT))
+    frontend = subprocess.Popen(
+        [str(BINARY)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, cwd=ROOT,
+    )
+
+    def send(frame):
+        frontend.stdin.write((json.dumps(frame) + "\n").encode())
+        frontend.stdin.flush()
+
+    def receive(request_id, timeout=15):
+        ready, _, _ = select.select([frontend.stdout], [], [], timeout)
+        assert ready, f"frontend gave no MCP response to {request_id}"
+        response = json.loads(frontend.stdout.readline())
+        assert response.get("id") == request_id, response
+        return response
+
+    try:
+        send({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "protocolVersion":"2025-03-26", "capabilities":{},
+            "clientInfo":{"name":"crash-owner", "version":"1"}}})
+        assert "result" in receive(1)
+        send({"jsonrpc":"2.0", "method":"notifications/initialized"})
+        send({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+            "name":"connect", "arguments":{"port":echo_device[2], "baudrate":115200}}})
+        connected = receive(2)
+        assert not connected["result"]["isError"], connected
+        assert len(_daemon_pids_for(real_runtime)) == 1
+        assert "Control granted" in "".join(x.get("text", "") for x in connected["result"]["content"])
+        frontend.kill()
+        frontend.wait(timeout=5)
+        frontend.stdin.close()
+        frontend.stdout.close()
+        frontend.stderr.close()
+        frontend = None
+
+        async def rejoin():
+            async with Client(transport(real_runtime, "rust-after-crash")) as client:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    result = await client.call_tool("connect", {"port":echo_device[2], "baudrate":57600}, raise_on_error=False)
+                    text = text_of(result)
+                    if not result.is_error and "Control granted" in text and "57600 baud" in text:
+                        return
+                    await asyncio.sleep(0.05)
+                raise AssertionError(f"device membership/control was not released after client crash: {text}")
+        asyncio.run(rejoin())
+    finally:
+        if frontend is not None and frontend.poll() is None:
+            frontend.kill()
+            frontend.wait(timeout=5)
+        echo_device[3].set()
+        echo_device[4].join(timeout=2)
+        os.close(echo_device[0])
+
+
 def test_rust_registers_daemon_during_idle_startup(tmp_path):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
@@ -152,7 +392,7 @@ def test_rust_registers_daemon_during_idle_startup(tmp_path):
 
     def handle(conn, frame):
         if frame["op"] == "hello":
-            _reply(conn, frame, _hello_result())
+            _reply(conn, frame, _hello_result(protocol=2))
         return True
 
     fake = ScriptedDaemon(runtime, handle)
@@ -199,7 +439,7 @@ def test_autostarted_daemon_survives_frontend_process_group_termination(tmp_path
         assert response.get("id") == 1 and "result" in response, response
         frontend.stdin.write((json.dumps({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "lease_status", "arguments": {}},
+            "params": {"name": "file_transfer_capabilities", "arguments": {}},
         }) + "\n").encode())
         frontend.stdin.flush()
         ready, _, _ = select.select([frontend.stdout], [], [], 15)
@@ -231,7 +471,7 @@ def test_autostarted_daemon_survives_frontend_process_group_termination(tmp_path
         frontend.stderr.close()
 
 
-def test_repeated_v2_rejection_does_not_deadlock_the_rust_frontend(tmp_path):
+def test_repeated_v2_calls_do_not_deadlock_the_rust_frontend(tmp_path):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
     runtime = tmp_path / "runtime"
@@ -271,12 +511,10 @@ def test_repeated_v2_rejection_does_not_deadlock_the_rust_frontend(tmp_path):
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         send({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "lease_status", "arguments": {}},
+            "params": {"name": "file_transfer_capabilities", "arguments": {}},
         })
         first = response_for(2)
-        first_message = "".join(block.get("text", "") for block in first["result"]["content"])
-        assert first["result"].get("isError") is True
-        assert "daemon protocol mismatch" in first_message
+        assert first["result"].get("isError") is False
         deadline = time.monotonic() + 5
         while not (pids := _daemon_pids_for(runtime)) and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -284,12 +522,10 @@ def test_repeated_v2_rejection_does_not_deadlock_the_rust_frontend(tmp_path):
 
         send({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "lease_status", "arguments": {}},
+            "params": {"name": "file_transfer_capabilities", "arguments": {}},
         })
         second = response_for(3, timeout=5)
-        second_message = "".join(block.get("text", "") for block in second["result"]["content"])
-        assert second["result"].get("isError") is True
-        assert "daemon protocol mismatch" in second_message
+        assert second["result"].get("isError") is False
     finally:
         if frontend.poll() is None:
             frontend.terminate()
@@ -309,7 +545,7 @@ def test_rust_never_replays_a_non_idempotent_call_after_its_reply_is_lost(tmp_pa
 
     def hello_then_drop_calls(conn, frame):
         if frame["op"] == "hello":
-            _reply(conn, frame, _hello_result())
+            _reply(conn, frame, _hello_result(protocol=2))
             return True
         return False
 
@@ -317,7 +553,7 @@ def test_rust_never_replays_a_non_idempotent_call_after_its_reply_is_lost(tmp_pa
 
     async def scenario():
         async with Client(transport(runtime, "rust-one-shot")) as client:
-            lost = await client.call_tool("send_command", {"text": "synthetic-reset"}, raise_on_error=False)
+            lost = await client.call_tool("send_command", {"port": "/dev/synthetic", "text": "synthetic-reset"}, raise_on_error=False)
             assert lost.is_error
             assert "not retried" in "".join(item.text for item in lost.content)
 
@@ -330,19 +566,16 @@ def test_rust_never_replays_a_non_idempotent_call_after_its_reply_is_lost(tmp_pa
         fake.close()
 
 
-@pytest.mark.parametrize("wire_version", [1, 2])
-def test_rust_delivers_daemon_protocol_mismatch_as_tool_error(tmp_path, wire_version):
+@pytest.mark.parametrize("wire_version", [1, 3])
+def test_rust_rejects_daemon_using_another_wire_version(tmp_path, wire_version):
     runtime = tmp_path / f"runtime-{wire_version}"
 
     def announce_version(conn, frame):
         if frame["op"] == "hello":
-            if wire_version == 1:
-                _reply(conn, frame, _hello_result(protocol=2))
-            else:
-                conn.sendall(json.dumps({
-                    "v": wire_version, "id": frame["id"], "ok": True,
-                    "result": _hello_result(),
-                }).encode() + b"\n")
+            conn.sendall(json.dumps({
+                "v": wire_version, "id": frame["id"], "ok": True,
+                "result": _hello_result(protocol=wire_version),
+            }).encode() + b"\n")
             return False
         return True
 
@@ -350,10 +583,11 @@ def test_rust_delivers_daemon_protocol_mismatch_as_tool_error(tmp_path, wire_ver
 
     async def scenario():
         async with Client(transport(runtime, f"protocol-{wire_version}")) as client:
-            result = await client.call_tool("lease_status", {}, raise_on_error=False)
+            result = await client.call_tool("file_transfer_capabilities", {}, raise_on_error=False)
             message = "".join(item.text for item in result.content)
             assert result.is_error
-            assert "protocol version 2" in message
+            assert "daemon protocol mismatch" in message
+            assert f"protocol version {wire_version}" in message
             assert "outcome unknown" not in message
 
     try:
@@ -362,7 +596,7 @@ def test_rust_delivers_daemon_protocol_mismatch_as_tool_error(tmp_path, wire_ver
         fake.close()
 
 
-def test_rust_identifies_the_daemons_v2_rejection_of_its_v1_hello(tmp_path):
+def test_rust_identifies_an_explicit_v2_protocol_rejection(tmp_path):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
     runtime = tmp_path / "runtime"
@@ -381,12 +615,12 @@ def test_rust_identifies_the_daemons_v2_rejection_of_its_v1_hello(tmp_path):
 
     async def scenario():
         async with Client(transport(runtime, "rust-v2-rejection")) as client:
-            result = await client.call_tool("lease_status", {}, raise_on_error=False)
+            result = await client.call_tool("file_transfer_capabilities", {}, raise_on_error=False)
             message = "".join(item.text for item in result.content)
             assert result.is_error
             assert "daemon protocol mismatch" in message
-            assert "frontend speaks protocol 1" in message
-            assert "peer speaks 2" in message
+            assert "frontend speaks protocol 2" in message
+            assert "protocol version 1 is not supported" in message
             assert "outcome unknown" not in message
 
     try:
@@ -400,12 +634,12 @@ def test_rust_waits_for_a_slow_daemon_tool_reply(tmp_path):
 
     def hello_then_slow_call(conn, frame):
         if frame["op"] == "hello":
-            _reply(conn, frame, _hello_result())
+            _reply(conn, frame, _hello_result(protocol=2))
         elif frame["op"] == "call":
             time.sleep(0.35)
             _reply(conn, frame, {"result": "completed after delay"})
         else:
-            _reply(conn, frame, {"lease": _hello_result()["lease"]})
+            _reply(conn, frame, {"result": "slow operation finished"})
         return True
 
     fake = ScriptedDaemon(runtime, hello_then_slow_call)
@@ -413,7 +647,7 @@ def test_rust_waits_for_a_slow_daemon_tool_reply(tmp_path):
     async def scenario():
         async with Client(transport(runtime, "rust-slow-call")) as client:
             start = time.monotonic()
-            result = await client.call_tool("tio_info", {})
+            result = await client.call_tool("file_transfer_capabilities", {})
             elapsed = time.monotonic() - start
             assert not result.is_error
             assert "completed after delay" in "".join(item.text for item in result.content)
@@ -425,7 +659,7 @@ def test_rust_waits_for_a_slow_daemon_tool_reply(tmp_path):
         fake.close()
 
 
-def test_uvx_installs_and_reports_the_native_frontend_protocol_mismatch(tmp_path):
+def test_uvx_installs_the_native_shared_app_frontend(tmp_path):
     uvx = shutil.which("uvx")
     if not uvx or not shutil.which("cargo"):
         pytest.skip("uvx and Cargo are required to verify the documented source-install path")
@@ -446,12 +680,10 @@ def test_uvx_installs_and_reports_the_native_frontend_protocol_mismatch(tmp_path
         )
         async with Client(transport) as client:
             tools = {tool.name for tool in await client.list_tools()}
-            assert {"connect", "lease_acquire", "lease_status"} <= tools
-            status = await client.call_tool("lease_status", {}, raise_on_error=False)
-            message = "".join(item.text for item in status.content)
-            assert status.is_error
-            assert "daemon protocol mismatch" in message
-            assert "frontend speaks protocol 1" in message
+            assert {"connect", "set_baudrate"} <= tools
+            assert {"lease_acquire", "lease_status"}.isdisjoint(tools)
+            status = await client.call_tool("file_transfer_capabilities", {}, raise_on_error=False)
+            assert not status.is_error
 
     try:
         asyncio.run(scenario())
@@ -488,10 +720,8 @@ def test_rust_frontend_autostarts_daemon_without_fastmcp_or_legacy_server(tmp_pa
                  "SERIAL_MCP_BLOCK_MARKER": str(marker), "PYTHONPATH": f"{blocker}:{ROOT}"},
             cwd=str(ROOT), keep_alive=False)
         async with Client(server) as client:
-            profiles = await client.call_tool("list_boot_profiles", {}, raise_on_error=False)
-            message = "".join(item.text for item in profiles.content)
-            assert profiles.is_error
-            assert "daemon protocol mismatch" in message
+            capabilities = await client.call_tool("file_transfer_capabilities", {}, raise_on_error=False)
+            assert not capabilities.is_error
 
     try:
         asyncio.run(scenario())
@@ -509,18 +739,18 @@ def test_rust_frontend_autostarts_daemon_without_fastmcp_or_legacy_server(tmp_pa
         assert not _daemon_pids_for(runtime), "isolated test daemon did not stop"
 
 
-def test_rust_clients_receive_clear_v2_protocol_mismatch(daemon, real_runtime):
+def test_multiple_rust_clients_register_with_the_v2_daemon(real_runtime):
     if not BINARY.is_file():
         pytest.skip("build rust-client first")
 
     async def scenario():
         async with Client(transport(real_runtime, "rust-one")) as first:
             async with Client(transport(real_runtime, "rust-two")) as second:
-                for client in (first, second):
-                    result = await client.call_tool("lease_status", {}, raise_on_error=False)
-                    message = "".join(item.text for item in result.content)
-                    assert result.is_error
-                    assert "daemon protocol mismatch" in message
-                    assert "frontend speaks protocol 1" in message
+                results = await asyncio.gather(
+                    first.call_tool("file_transfer_capabilities", {}, raise_on_error=False),
+                    second.call_tool("file_transfer_capabilities", {}, raise_on_error=False),
+                )
+                assert all(not result.is_error for result in results), [text_of(r) for r in results]
+                assert len(_daemon_pids_for(real_runtime)) == 1
 
     asyncio.run(scenario())
